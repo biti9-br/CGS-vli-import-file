@@ -1,0 +1,5 @@
+{
+  "name": "VLI Cargosnap Importer",
+  "description": "Automação de De-Para de Excel para CSV e simulador de importação para a API do Cargosnap com desduplicação e tratamento de aspas.",
+  "requestFramePermissions": []
+}

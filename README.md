@@ -1,11 +1,38 @@
-<div align="center">
+# VLI → Cargosnap Importer Automation
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+Este projeto é uma automação web desenvolvida para substituir e aprimorar o script original de importação de dados da VLI para a plataforma Cargosnap.
 
-  <h1>Built with AI Studio</h2>
+## Funcionalidades
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+1. **Upload de Arquivos**: Suporte para planilhas Excel (`.xlsx`, `.xls`) e arquivos `.csv`.
+2. **Mapeamento (De-Para)**: Interface visual para mapear as colunas do arquivo original para os IDs correspondentes no Cargosnap.
+3. **Desduplicação**: Seleção da coluna `Reference` para garantir que registros duplicados sejam tratados (mantendo o último registro).
+4. **Correção de Parser (RFC 4180)**: Geração de CSV utilizando a biblioteca `PapaParse`, que corrige o bug do script original ao tratar aspas duplas internas (ex: endereços).
+5. **Simulador de Importação**: 
+   - Validação de formato do Token da API.
+   - Controle de `delay` configurável (originalmente fixo em 500ms).
+   - Flag `closeExisting` configurável.
+   - **Persistência de Sessão**: Se a página for recarregada ou fechada acidentalmente, a importação pode ser retomada exatamente de onde parou (usando `localStorage`).
+   - Console visual com logs em tempo real e barra de progresso.
+6. **Histórico de Importações**: Aba lateral retrátil que armazena o histórico das importações realizadas, com status, data e quantidade de registros processados.
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
+## Como Usar
 
-</div>
+1. Acesse a aplicação.
+2. No Passo 1, faça o upload da planilha com os dados de equipamentos ou locais de instalação.
+3. No Passo 2, selecione qual coluna representa o `Reference` e preencha os IDs do Cargosnap para as demais colunas.
+4. Clique em "Processar e Desduplicar".
+5. No Passo 3, você pode baixar o CSV corrigido e formatado, ou prosseguir para o simulador.
+6. No Passo 4, insira o Token da API, ajuste o delay e inicie a simulação de importação.
+
+## Requisitos Técnicos
+
+- Node.js & npm
+- React 19
+- Tailwind CSS 4
+- Bibliotecas principais: `xlsx` (SheetJS), `papaparse`, `lucide-react`
+
+## LGPD e Segurança
+
+- **Nenhum dado sensível é persistido** no servidor. Todo o processamento de planilhas e geração de CSV ocorre localmente no navegador do usuário (Client-side).
+- O Token da API inserido no simulador é mantido apenas em memória durante a sessão ativa.
