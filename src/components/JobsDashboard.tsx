@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Play, Pause, Square, RefreshCw, CheckCircle2, XCircle, Clock, FileText, AlertCircle, ChevronDown, ChevronUp } from 'lucide-react';
+import { Play, Pause, Square, RefreshCw, CheckCircle2, XCircle, Clock, FileText, AlertCircle, ChevronDown, ChevronUp, Trash2 } from 'lucide-react';
 
 interface Job {
   id: string;
@@ -10,11 +10,17 @@ interface Job {
   updatedAt: string;
 }
 
-export default function JobsDashboard() {
+interface JobsDashboardProps {
+  showModal: (title: string, message: string, type: 'info' | 'success' | 'error') => void;
+  showConfirm: (title: string, message: string, onConfirm: () => void) => void;
+}
+
+export default function JobsDashboard({ showModal, showConfirm }: JobsDashboardProps) {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedJob, setSelectedJob] = useState<string | null>(null);
   const [jobDetails, setJobDetails] = useState<any>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
 
   const fetchJobs = async () => {
     try {
@@ -60,6 +66,30 @@ export default function JobsDashboard() {
   const handleResume = async (id: string) => {
     await fetch(`/api/jobs/${id}/resume`, { method: 'POST' });
     fetchJobs();
+  };
+
+  const handleDelete = async (id: string) => {
+    showConfirm(
+      'Excluir Importação',
+      'Tem certeza que deseja excluir esta importação? Esta ação não pode ser desfeita.',
+      async () => {
+        setIsDeleting(true);
+        try {
+          const res = await fetch(`/api/jobs/${id}`, { method: 'DELETE' });
+          if (res.ok) {
+            showModal('Sucesso', 'Importação excluída com sucesso.', 'success');
+            fetchJobs();
+          } else {
+            throw new Error('Falha ao excluir importação');
+          }
+        } catch (e) {
+          console.error(e);
+          showModal('Erro', 'Não foi possível excluir a importação.', 'error');
+        } finally {
+          setIsDeleting(false);
+        }
+      }
+    );
   };
 
   const getStatusBadge = (status: string) => {
@@ -137,6 +167,15 @@ export default function JobsDashboard() {
                       <Play size={18} />
                     </button>
                   )}
+                  {(job.status === 'paused' || job.status === 'failed' || job.status === 'completed') && (
+                    <button 
+                      onClick={(e) => { e.stopPropagation(); handleDelete(job.id); }}
+                      className="p-2 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                      title="Excluir Importação"
+                    >
+                      <Trash2 size={18} />
+                    </button>
+                  )}
                   {selectedJob === job.id ? <ChevronUp size={20} className="text-slate-400" /> : <ChevronDown size={20} className="text-slate-400" />}
                 </div>
               </div>
@@ -178,7 +217,7 @@ export default function JobsDashboard() {
                             </div>
                             {log.details && (
                               <details className="ml-14 mt-1">
-                                <summary className="cursor-pointer text-[10px] opacity-80 hover:opacity-100 uppercase tracking-wider font-semibold">Ver detalhes do erro</summary>
+                                <summary className="cursor-pointer text-[10px] opacity-80 hover:opacity-100 uppercase tracking-wider font-semibold">Ver detalhes</summary>
                                 <pre className="mt-2 p-3 bg-slate-950 rounded-lg text-[10px] overflow-x-auto border border-slate-800 shadow-inner custom-scrollbar">
                                   {typeof log.details === 'string' ? log.details : JSON.stringify(log.details, null, 2)}
                                 </pre>
@@ -195,6 +234,11 @@ export default function JobsDashboard() {
               )}
             </div>
           ))}
+        </div>
+      )}
+      {isDeleting && (
+        <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-[60] flex items-center justify-center">
+          <RefreshCw className="animate-spin text-white" size={32} />
         </div>
       )}
     </div>

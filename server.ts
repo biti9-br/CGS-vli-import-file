@@ -12,6 +12,8 @@ const __dirname = path.dirname(__filename);
 const CONFIG_FILE = path.join(__dirname, "config.json");
 const LOGS_FILE = path.join(__dirname, "logs.json");
 const JOBS_DIR = path.join(__dirname, "data", "jobs");
+const TEMPLATE_CONFIG_FILE = path.join(__dirname, "template", "template_config.json");
+const TEMPLATE_XLSX_FILE = path.join(__dirname, "template", "Template Padrão.xlsx");
 
 interface ImportJob {
   id: string;
@@ -127,9 +129,15 @@ async function processJob(jobId: string) {
       await addLog('success', `[${i+1}/${job.total}] Sucesso: POST /files`, createData);
 
       // 2. POST /fields
-      const fieldsToUpdate = Object.keys(row).filter(k => k !== 'reference' && k !== 'location');
-      if (fieldsToUpdate.length > 0) {
-        const fieldsPayload = fieldsToUpdate.map(k => ({ id: k, value: row[k] }));
+      const fieldsPayload = Object.keys(row)
+        .filter(k => k !== 'reference' && k !== 'location')
+        .filter(k => {
+          const val = row[k];
+          return val !== null && val !== undefined && String(val).trim() !== "";
+        })
+        .map(k => ({ id: k, value: row[k] }));
+
+      if (fieldsPayload.length > 0) {
         await addLog('info', `[${i+1}/${job.total}] Chamada API: POST /fields/${row.reference}`, fieldsPayload);
 
         const fieldsResponse = await fetch(`https://api.cargosnap.com/api/v2/fields/${encodeURIComponent(row.reference)}?token=${job.config.apiToken}`, {
@@ -217,14 +225,48 @@ async function readConfig() {
     return JSON.parse(data);
   } catch (error: any) {
     if (error.code === "ENOENT") {
-      return null;
+      try {
+        const templateData = await fs.readFile(TEMPLATE_CONFIG_FILE, "utf-8");
+        const config = JSON.parse(templateData);
+        try {
+          const xlsxBuffer = await fs.readFile(TEMPLATE_XLSX_FILE);
+          config.templateFileBase64 = `data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${xlsxBuffer.toString('base64')}`;
+        } catch (e) {
+          // ignore if xlsx not found
+        }
+        return config;
+      } catch (e) {
+        return null;
+      }
     }
     throw error;
   }
 }
 
 async function writeConfig(config: any) {
+  // Save to main config file
   await fs.writeFile(CONFIG_FILE, JSON.stringify(config, null, 2), "utf-8");
+  
+  // Also update the template directory to make it the new default
+  try {
+    const templateDir = path.join(__dirname, "template");
+    await fs.mkdir(templateDir, { recursive: true });
+    
+    // Create a copy of config without the base64 file for the template config
+    const { templateFileBase64, ...templateConfig } = config;
+    await fs.writeFile(TEMPLATE_CONFIG_FILE, JSON.stringify(templateConfig, null, 2), "utf-8");
+    
+    // If there's a template file, save it as the new default XLSX
+    if (templateFileBase64) {
+      const base64Data = templateFileBase64.split(';base64,').pop();
+      if (base64Data) {
+        await fs.writeFile(TEMPLATE_XLSX_FILE, Buffer.from(base64Data, 'base64'));
+      }
+    }
+  } catch (error) {
+    console.error('Failed to update template directory', error);
+    // We don't throw here to avoid failing the main config save
+  }
 }
 
 async function deleteConfig() {
@@ -239,9 +281,31 @@ async function deleteConfig() {
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
-  app.use(express.json());
+  app.use(express.json({ limit: '50mb' }));
+  app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+  // Ensure template directory is updated with current config on startup
+  try {
+    const currentConfig = await readConfig();
+    if (currentConfig) {
+      await writeConfig(currentConfig);
+      await writeLog({ type: 'info', message: 'Diretório de template atualizado com a configuração atual do sistema.' });
+    }
+  } catch (e) {
+    console.error('Failed to initialize template from current config', e);
+  }
+
+  // Dynamic Environment Variables Injection
+  app.get("/env-config.js", (req, res) => {
+    const env = {
+      GEMINI_API_KEY: process.env.GEMINI_API_KEY || "",
+      MY_APP_URL: process.env.MY_APP_URL || "",
+    };
+    res.type("application/javascript");
+    res.send(`window.ENV = ${JSON.stringify(env)};`);
+  });
 
   // API Routes
   app.get("/api/config", async (req, res) => {
@@ -255,7 +319,7 @@ async function startServer() {
 
   app.post("/api/config", async (req, res) => {
     try {
-      const { referenceColumn, locationId, locationColumn, columnMapping, rawHeaders, fileName, sampleData } = req.body;
+      const { referenceColumn, locationId, locationColumn, columnMapping, rawHeaders, fileName, sampleData, templateFileBase64 } = req.body;
       
       const config = {
         referenceColumn,
@@ -265,6 +329,7 @@ async function startServer() {
         rawHeaders,
         fileName,
         sampleData,
+        templateFileBase64,
         updatedAt: new Date().toISOString()
       };
 
@@ -305,6 +370,16 @@ async function startServer() {
     }
   });
 
+  app.delete("/api/logs", async (req, res) => {
+    try {
+      await fs.writeFile(LOGS_FILE, JSON.stringify([], null, 2), 'utf-8');
+      await writeLog({ type: 'info', message: 'Histórico de logs limpo pelo administrador.' });
+      res.json({ success: true });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
   // Job Manager Endpoints
   app.post("/api/jobs", async (req, res) => {
     try {
@@ -337,6 +412,21 @@ async function startServer() {
     try {
       const jobs = await listJobs();
       res.json(jobs);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.delete("/api/jobs/:id", async (req, res) => {
+    try {
+      const id = req.params.id;
+      const jobPath = path.join(JOBS_DIR, `${id}.json`);
+      if (activeJobs.has(id)) {
+        return res.status(400).json({ error: 'Cannot delete a running job' });
+      }
+      await fs.unlink(jobPath);
+      await writeLog({ type: 'info', message: `Importação excluída pelo usuário: Job ${id}` });
+      res.json({ success: true });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
@@ -452,8 +542,9 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  app.listen(PORT, "0.0.0.0", async () => {
     console.log(`Server running on http://localhost:${PORT}`);
+    await writeLog({ type: 'info', message: 'Servidor iniciado e pronto para operações.' });
   });
 }
 

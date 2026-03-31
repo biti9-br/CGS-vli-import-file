@@ -5,19 +5,22 @@ import { Upload, Settings, FileSpreadsheet, ChevronLeft, CheckCircle, HelpCircle
 
 interface AdminConfigProps {
   showModal: (title: string, message: string, type: 'info' | 'success' | 'error') => void;
+  showConfirm: (title: string, message: string, onConfirm: () => void) => void;
 }
 
-export default function AdminConfig({ showModal }: AdminConfigProps) {
+export default function AdminConfig({ showModal, showConfirm }: AdminConfigProps) {
   const [currentStep, setCurrentStep] = useState<'upload' | 'mapping'>('upload');
   const [fileName, setFileName] = useState<string>('');
   const [rawHeaders, setRawHeaders] = useState<string[]>([]);
   const [rawData, setRawData] = useState<any[]>([]);
+  const [templateFileBase64, setTemplateFileBase64] = useState<string>('');
   
   const [referenceColumn, setReferenceColumn] = useState<string>('');
   const [locationId, setLocationId] = useState<string>('');
   const [locationColumn, setLocationColumn] = useState<string>('');
   const [columnMapping, setColumnMapping] = useState<Record<string, string>>({});
   const [activeHelp, setActiveHelp] = useState<'reference' | 'location' | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
 
   useEffect(() => {
     const fetchConfig = async () => {
@@ -31,6 +34,9 @@ export default function AdminConfig({ showModal }: AdminConfigProps) {
           setColumnMapping(config.columnMapping || {});
           setRawHeaders(config.rawHeaders || []);
           setFileName(config.fileName || '');
+          if (config.templateFileBase64) {
+            setTemplateFileBase64(config.templateFileBase64);
+          }
           if (config.sampleData) {
             setRawData(config.sampleData);
           }
@@ -45,27 +51,49 @@ export default function AdminConfig({ showModal }: AdminConfigProps) {
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
+      setIsLoading(true);
       setFileName(file.name);
+      
+      // Read file as base64 for storage
+      const base64Reader = new FileReader();
+      base64Reader.onload = (evt) => {
+        const base64 = evt.target?.result as string;
+        setTemplateFileBase64(base64);
+      };
+      base64Reader.readAsDataURL(file);
+
+      // Read file for parsing
       const reader = new FileReader();
       
       reader.onload = (evt) => {
-        const bstr = evt.target?.result;
-        const wb = XLSX.read(bstr, { type: 'binary' });
-        const wsname = wb.SheetNames[0];
-        const ws = wb.Sheets[wsname];
-        const data = XLSX.utils.sheet_to_json(ws);
-        
-        if (data.length > 0) {
-          const headers = Object.keys(data[0] as object);
-          setRawHeaders(headers);
-          setRawData(data);
+        try {
+          const bstr = evt.target?.result;
+          const wb = XLSX.read(bstr, { type: 'binary' });
+          const wsname = wb.SheetNames[0];
+          const ws = wb.Sheets[wsname];
+          const data = XLSX.utils.sheet_to_json(ws);
           
-          if (!referenceColumn) {
-            const refCol = headers.find(h => h.toLowerCase().includes('reference') || h.toLowerCase().includes('referencia'));
-            if (refCol) setReferenceColumn(refCol);
+          if (data.length > 0) {
+            const headers = Object.keys(data[0] as object);
+            setRawHeaders(headers);
+            setRawData(data);
+            
+            if (!referenceColumn) {
+              const refCol = headers.find(h => h.toLowerCase().includes('reference') || h.toLowerCase().includes('referencia'));
+              if (refCol) setReferenceColumn(refCol);
+            }
+            setCurrentStep('mapping');
           }
-          setCurrentStep('mapping');
+        } catch (err) {
+          console.error(err);
+          showModal('Erro', 'Falha ao processar arquivo Excel.', 'error');
+        } finally {
+          setIsLoading(false);
         }
+      };
+      reader.onerror = () => {
+        setIsLoading(false);
+        showModal('Erro', 'Erro ao ler arquivo.', 'error');
       };
       reader.readAsBinaryString(file);
     }
@@ -79,6 +107,7 @@ export default function AdminConfig({ showModal }: AdminConfigProps) {
   };
 
   const saveGlobalMapping = async () => {
+    setIsLoading(true);
     const config = {
       referenceColumn,
       locationId,
@@ -86,7 +115,8 @@ export default function AdminConfig({ showModal }: AdminConfigProps) {
       columnMapping,
       rawHeaders,
       fileName,
-      sampleData: rawData.slice(0, 5)
+      sampleData: rawData.slice(0, 5),
+      templateFileBase64
     };
 
     try {
@@ -117,11 +147,14 @@ export default function AdminConfig({ showModal }: AdminConfigProps) {
         locCol: locationColumn,
         mapping: columnMapping
       }));
+    } finally {
+      setIsLoading(false);
     }
   };
 
   const deleteGlobalMapping = async () => {
-    if (window.confirm('Tem certeza que deseja excluir a parametrização atual?')) {
+    showConfirm('Confirmar Exclusão', 'Tem certeza que deseja excluir a parametrização atual?', async () => {
+      setIsLoading(true);
       try {
         await fetch('/api/config', { method: 'DELETE' });
         localStorage.removeItem('cargosnap_global_mapping');
@@ -130,16 +163,29 @@ export default function AdminConfig({ showModal }: AdminConfigProps) {
         setColumnMapping({});
         setRawHeaders([]);
         setFileName('');
+        setTemplateFileBase64('');
         setCurrentStep('upload');
         showModal('Sucesso', 'Parametrização excluída com sucesso!', 'success');
       } catch (e) {
         console.error(e);
         showModal('Erro', 'Erro ao excluir parametrização.', 'error');
+      } finally {
+        setIsLoading(false);
       }
-    }
+    });
   };
 
   const downloadTemplate = () => {
+    if (templateFileBase64) {
+      const link = document.createElement('a');
+      link.href = templateFileBase64;
+      link.download = fileName || 'template_importacao.xlsx';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      return;
+    }
+
     const csv = Papa.unparse({
       fields: rawHeaders,
       data: rawData.length > 0 ? rawData : []
@@ -229,6 +275,10 @@ export default function AdminConfig({ showModal }: AdminConfigProps) {
               <p className="text-slate-500 text-sm text-center max-w-sm">
                 Arraste ou clique para selecionar o arquivo de template que servirá como base para o De-Para.
               </p>
+              <div className="mt-6 flex items-center gap-2 px-4 py-2 bg-amber-50 border border-amber-100 rounded-lg text-amber-700 text-xs font-medium">
+                <Info size={14} className="shrink-0" />
+                <span>Importante: A planilha deve conter pelo menos um registro de exemplo com todas as células preenchidas para o mapeamento correto.</span>
+              </div>
             </div>
 
             {rawHeaders.length > 0 && (
@@ -434,6 +484,22 @@ export default function AdminConfig({ showModal }: AdminConfigProps) {
                 </table>
               </div>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Loading Overlay */}
+      {isLoading && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md z-[100] flex flex-col items-center justify-center p-6 animate-in fade-in duration-300">
+          <div className="relative">
+            <div className="w-20 h-20 border-4 border-indigo-500/20 border-t-indigo-500 rounded-full animate-spin"></div>
+            <div className="absolute inset-0 flex items-center justify-center">
+              <div className="w-10 h-10 border-4 border-indigo-500/10 border-b-indigo-500 rounded-full animate-spin opacity-50" style={{ animationDirection: 'reverse', animationDuration: '3s' }}></div>
+            </div>
+          </div>
+          <div className="mt-8 text-center">
+            <h3 className="text-xl font-bold text-white mb-2 tracking-tight">Processando</h3>
+            <p className="text-indigo-200/70 text-sm font-medium animate-pulse">Por favor, aguarde um momento...</p>
           </div>
         </div>
       )}

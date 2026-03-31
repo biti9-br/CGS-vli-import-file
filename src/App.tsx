@@ -65,6 +65,7 @@ const getErrorMessage = (status: number): string => {
 
 export default function App() {
   const [currentStep, setCurrentStep] = useState<Step>('upload');
+  const [isLoading, setIsLoading] = useState(false);
   const isAdmin = window.location.pathname === '/admin';
   const [adminTab, setAdminTab] = useState<'config' | 'logs'>('config');
   const [userTab, setUserTab] = useState<'import' | 'jobs'>('import');
@@ -87,6 +88,7 @@ export default function App() {
   const [rawHeaders, setRawHeaders] = useState<string[]>([]);
   const [rawData, setRawData] = useState<any[]>([]);
   const [templateSampleData, setTemplateSampleData] = useState<any[]>([]);
+  const [templateFileBase64, setTemplateFileBase64] = useState<string>('');
   
   // Mapping Data
   const [referenceColumn, setReferenceColumn] = useState<string>('');
@@ -149,6 +151,9 @@ export default function App() {
           setColumnMapping(config.columnMapping || {});
           setRawHeaders(config.rawHeaders || []);
           setFileName(config.fileName || '');
+          if (config.templateFileBase64) {
+            setTemplateFileBase64(config.templateFileBase64);
+          }
           if (config.sampleData) {
             setTemplateSampleData(config.sampleData);
           }
@@ -299,6 +304,7 @@ export default function App() {
     const file = e.target.files?.[0];
     if (!file) return;
     
+    setIsLoading(true);
     setFileName(file.name);
     const isCsv = file.name.toLowerCase().endsWith('.csv');
 
@@ -359,32 +365,50 @@ export default function App() {
               setCsvContent(csv);
               addLog('info', `Arquivo carregado pelo usuário: ${file.name} (${finalData.length} registros válidos).`);
               setCurrentStep('preview');
+              setIsLoading(false);
             } else {
               // Raw CSV, apply mapping
               addLog('info', `Arquivo carregado pelo usuário: ${file.name}. Aplicando mapeamento...`);
               processExcelData(results.data, headers);
+              setIsLoading(false);
             }
           }
+        },
+        error: (err) => {
+          console.error('CSV Parse Error:', err);
+          setIsLoading(false);
+          showModal('Erro', 'Falha ao processar arquivo CSV.', 'error');
         }
       });
     } else {
       // Excel Import
       const reader = new FileReader();
       reader.onload = (evt) => {
-        const bstr = evt.target?.result;
-        const wb = XLSX.read(bstr, { type: 'binary' });
-        const wsname = wb.SheetNames[0];
-        const ws = wb.Sheets[wsname];
-        const data = XLSX.utils.sheet_to_json(ws, { defval: '' });
-        
-        if (data.length > 0) {
-          const headers = Object.keys(data[0] as object);
-          setRawHeaders(headers);
-          setRawData(data);
+        try {
+          const bstr = evt.target?.result;
+          const wb = XLSX.read(bstr, { type: 'binary' });
+          const wsname = wb.SheetNames[0];
+          const ws = wb.Sheets[wsname];
+          const data = XLSX.utils.sheet_to_json(ws, { defval: '' });
           
-          addLog('info', `Arquivo Excel carregado pelo usuário: ${file.name}. Aplicando mapeamento...`);
-          processExcelData(data, headers);
+          if (data.length > 0) {
+            const headers = Object.keys(data[0] as object);
+            setRawHeaders(headers);
+            setRawData(data);
+            
+            addLog('info', `Arquivo Excel carregado pelo usuário: ${file.name}. Aplicando mapeamento...`);
+            processExcelData(data, headers);
+          }
+        } catch (err) {
+          console.error('Excel Parse Error:', err);
+          showModal('Erro', 'Falha ao processar arquivo Excel.', 'error');
+        } finally {
+          setIsLoading(false);
         }
+      };
+      reader.onerror = () => {
+        setIsLoading(false);
+        showModal('Erro', 'Erro ao ler arquivo.', 'error');
       };
       reader.readAsBinaryString(file);
     }
@@ -488,6 +512,18 @@ export default function App() {
       showModal('Atenção', 'Nenhum template configurado. Peça ao administrador para configurar o De-Para.', 'error');
       return;
     }
+
+    if (templateFileBase64) {
+      const link = document.createElement('a');
+      link.href = templateFileBase64;
+      link.download = fileName || 'template_importacao.xlsx';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      addLog('info', 'Template baixado pelo usuário (Arquivo Original).');
+      return;
+    }
+
     const csv = Papa.unparse({
       fields: rawHeaders,
       data: templateSampleData.length > 0 ? templateSampleData : []
@@ -539,6 +575,7 @@ export default function App() {
       return;
     }
     
+    setIsLoading(true);
     try {
       const response = await fetch('/api/jobs', {
         method: 'POST',
@@ -564,6 +601,8 @@ export default function App() {
       
     } catch (error) {
       showModal('Erro', 'Não foi possível iniciar a importação.', 'error');
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -730,9 +769,9 @@ export default function App() {
             )}
           </div>
         ) : isAdmin && adminTab === 'config' ? (
-          <AdminConfig showModal={showModal} />
+          <AdminConfig showModal={showModal} showConfirm={showConfirm} />
         ) : !isAdmin && userTab === 'jobs' ? (
-          <JobsDashboard />
+          <JobsDashboard showModal={showModal} showConfirm={showConfirm} />
         ) : (
           <>
             {/* Stepper */}
@@ -1026,7 +1065,7 @@ export default function App() {
                           </div>
                           {log.details && (
                             <details className="ml-14 mt-1">
-                              <summary className="cursor-pointer text-[10px] opacity-80 hover:opacity-100 uppercase tracking-wider font-semibold">Ver detalhes do erro</summary>
+                              <summary className="cursor-pointer text-[10px] opacity-80 hover:opacity-100 uppercase tracking-wider font-semibold">Ver detalhes</summary>
                               <pre className="mt-2 p-3 bg-slate-950 rounded-lg text-[10px] overflow-x-auto border border-slate-800 shadow-inner custom-scrollbar">
                                 {typeof log.details === 'string' ? log.details : JSON.stringify(log.details, null, 2)}
                               </pre>
@@ -1097,6 +1136,10 @@ export default function App() {
   body: JSON.stringify(${JSON.stringify(
     Object.keys(processedData[previewIndex])
       .filter(k => k !== 'reference' && k !== 'location')
+      .filter(k => {
+        const val = processedData[previewIndex][k];
+        return val !== null && val !== undefined && String(val).trim() !== "";
+      })
       .map(k => ({
         id: k,
         value: processedData[previewIndex][k]
@@ -1222,6 +1265,21 @@ export default function App() {
                 </button>
               </div>
             )}
+          </div>
+        </div>
+      )}
+      {/* Loading Overlay */}
+      {isLoading && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md z-[100] flex flex-col items-center justify-center p-6 animate-in fade-in duration-300">
+          <div className="relative">
+            <div className="w-20 h-20 border-4 border-indigo-500/20 border-t-indigo-500 rounded-full animate-spin"></div>
+            <div className="absolute inset-0 flex items-center justify-center">
+              <div className="w-10 h-10 border-4 border-indigo-500/10 border-b-indigo-500 rounded-full animate-spin opacity-50" style={{ animationDirection: 'reverse', animationDuration: '3s' }}></div>
+            </div>
+          </div>
+          <div className="mt-8 text-center">
+            <h3 className="text-xl font-bold text-white mb-2 tracking-tight">Processando</h3>
+            <p className="text-indigo-200/70 text-sm font-medium animate-pulse">Por favor, aguarde um momento...</p>
           </div>
         </div>
       )}
