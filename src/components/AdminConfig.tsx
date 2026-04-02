@@ -175,15 +175,60 @@ export default function AdminConfig({ showModal, showConfirm }: AdminConfigProps
     });
   };
 
-  const downloadTemplate = () => {
+  const downloadTemplate = async () => {
+    try {
+      const response = await fetch('/api/template/download');
+      if (response.ok) {
+        const blob = await response.blob();
+        const link = document.createElement('a');
+        const url = URL.createObjectURL(blob);
+        link.href = url;
+        link.download = fileName || 'template_importacao.xlsx';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+        return;
+      }
+    } catch (error) {
+      console.error("Error downloading template from server:", error);
+    }
+
+    // Fallback to base64 or CSV generation if server download fails
     if (templateFileBase64) {
-      const link = document.createElement('a');
-      link.href = templateFileBase64;
-      link.download = fileName || 'template_importacao.xlsx';
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      return;
+      try {
+        // Extract the base64 data part
+        const base64Data = templateFileBase64.split(';base64,').pop();
+        if (!base64Data) throw new Error("Invalid base64 string");
+
+        // Convert base64 to Blob
+        const byteCharacters = atob(base64Data);
+        const byteNumbers = new Array(byteCharacters.length);
+        for (let i = 0; i < byteCharacters.length; i++) {
+          byteNumbers[i] = byteCharacters.charCodeAt(i);
+        }
+        const byteArray = new Uint8Array(byteNumbers);
+        
+        // Determine mime type from base64 string or default to xlsx
+        let mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+        const mimeMatch = templateFileBase64.match(/^data:(.*?);base64,/);
+        if (mimeMatch && mimeMatch[1]) {
+          mimeType = mimeMatch[1];
+        }
+
+        const blob = new Blob([byteArray], { type: mimeType });
+        const link = document.createElement('a');
+        const url = URL.createObjectURL(blob);
+        link.href = url;
+        link.download = fileName || 'template_importacao.xlsx';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+        return;
+      } catch (error) {
+        console.error("Error downloading base64 file:", error);
+      }
     }
 
     const csv = Papa.unparse({
@@ -197,15 +242,18 @@ export default function AdminConfig({ showModal, showConfirm }: AdminConfigProps
       newline: "\r\n"
     });
     
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    // Add BOM for Excel compatibility
+    const bom = new Uint8Array([0xEF, 0xBB, 0xBF]);
+    const blob = new Blob([bom, csv], { type: 'text/csv;charset=utf-8;' });
     const link = document.createElement("a");
     const url = URL.createObjectURL(blob);
     link.setAttribute("href", url);
-    link.setAttribute("download", fileName || 'template.csv');
+    link.setAttribute("download", (fileName ? fileName.replace(/\.[^/.]+$/, "") : 'template') + '.csv');
     link.style.visibility = 'hidden';
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   };
 
   const steps = [

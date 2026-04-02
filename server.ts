@@ -317,6 +317,20 @@ async function startServer() {
     }
   });
 
+  app.get("/api/template/download", async (req, res) => {
+    try {
+      // Check if the template file exists
+      try {
+        await fs.access(TEMPLATE_XLSX_FILE);
+        res.download(TEMPLATE_XLSX_FILE, "Template_Padrao.xlsx");
+      } catch (e) {
+        res.status(404).json({ error: "Template file not found" });
+      }
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
   app.post("/api/config", async (req, res) => {
     try {
       const { referenceColumn, locationId, locationColumn, columnMapping, rawHeaders, fileName, sampleData, templateFileBase64 } = req.body;
