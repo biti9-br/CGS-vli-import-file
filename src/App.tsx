@@ -66,6 +66,7 @@ const getErrorMessage = (status: number): string => {
 export default function App() {
   const [currentStep, setCurrentStep] = useState<Step>('upload');
   const [isLoading, setIsLoading] = useState(false);
+  const [isFetchingConfig, setIsFetchingConfig] = useState(true);
   const isAdmin = window.location.pathname === '/admin';
   const [adminTab, setAdminTab] = useState<'config' | 'logs'>('config');
   const [userTab, setUserTab] = useState<'import' | 'jobs'>('import');
@@ -171,6 +172,8 @@ export default function App() {
             setColumnMapping(mapping);
           } catch (e) {}
         }
+      } finally {
+        setIsFetchingConfig(false);
       }
     };
 
@@ -874,16 +877,22 @@ export default function App() {
                   </p>
                 </div>
                 
-                {rawHeaders.length > 0 && (
-                  <div className="mt-6 flex justify-center">
-                    <button 
-                      onClick={downloadTemplate}
-                      className="flex items-center gap-2 px-6 py-2.5 bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 hover:text-indigo-600 rounded-xl font-medium transition-colors shadow-sm"
-                    >
-                      <Download size={18} />
-                      Baixar Template Configurado
-                    </button>
+                {isFetchingConfig ? (
+                  <div className="mt-6 flex justify-center w-full">
+                    <div className="h-[46px] bg-slate-200 rounded-xl w-64 animate-pulse"></div>
                   </div>
+                ) : (
+                  rawHeaders.length > 0 && (
+                    <div className="mt-6 flex justify-center">
+                      <button 
+                        onClick={downloadTemplate}
+                        className="flex items-center gap-2 px-6 py-2.5 bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 hover:text-indigo-600 rounded-xl font-medium transition-colors shadow-sm"
+                      >
+                        <Download size={18} />
+                        Baixar Template Configurado
+                      </button>
+                    </div>
+                  )
                 )}
               </div>
             </div>
