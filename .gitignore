@@ -9,3 +9,5 @@ coverage/
 config.json
 logs.json
 data/
+!template/
+!template/*

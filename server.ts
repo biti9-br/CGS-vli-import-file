@@ -12,7 +12,7 @@ const __dirname = path.dirname(__filename);
 const CONFIG_FILE = path.join(__dirname, "config.json");
 const LOGS_FILE = path.join(__dirname, "logs.json");
 const JOBS_DIR = path.join(__dirname, "data", "jobs");
-const TEMPLATE_CONFIG_FILE = path.join(__dirname, "template", "template_config.json");
+const TEMPLATE_CONFIG_FILE = path.join(__dirname, "template", "template.json");
 const TEMPLATE_XLSX_FILE = path.join(__dirname, "template", "Template Padrão.xlsx");
 
 interface ImportJob {
@@ -288,10 +288,16 @@ async function startServer() {
 
   // Ensure template directory is updated with current config on startup
   try {
-    const currentConfig = await readConfig();
-    if (currentConfig) {
-      await writeConfig(currentConfig);
-      await writeLog({ type: 'info', message: 'Diretório de template atualizado com a configuração atual do sistema.' });
+    const configExists = fsSync.existsSync(CONFIG_FILE);
+    if (configExists) {
+      const currentConfig = await readConfig();
+      if (currentConfig) {
+        // Sync current config to template directory to ensure it persists as the new default
+        await writeConfig(currentConfig);
+        await writeLog({ type: 'info', message: 'Configuração atual persistida como novo padrão default no diretório de template.' });
+      }
+    } else {
+      await writeLog({ type: 'info', message: 'Iniciando com configurações padrão do diretório de template.' });
     }
   } catch (e) {
     console.error('Failed to initialize template from current config', e);

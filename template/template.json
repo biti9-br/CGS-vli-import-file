@@ -1,0 +1,63 @@
+{
+  "referenceColumn": "Local de instalação \r\nou\r\nEquipamento",
+  "locationId": "6203",
+  "locationColumn": "Equipe",
+  "columnMapping": {
+    "Empresa": "9144",
+    "Centro": "9145",
+    "Site": "9148",
+    "Corredor": "9149",
+    "Município - UF": "9150",
+    "Denominação do loc.instalação": "9143",
+    "Local de instalação superior": "9146",
+    "Nome do local de instalação superior": "9147",
+    "Denominação do equipamento": "9204",
+    "Nº série fabricante": "9205",
+    "Equipamento superior": "9206",
+    "Denominação do equipamento superior": "9207",
+    "Ano de construção": "9208",
+    "Data de aquisição": "9209",
+    "Fabricante do imobilizado": "9210"
+  },
+  "rawHeaders": [
+    "Equipe",
+    "Local de instalação \r\nou\r\nEquipamento",
+    "Empresa",
+    "Centro",
+    "Site",
+    "Corredor",
+    "Município - UF",
+    "Denominação do loc.instalação",
+    "Local de instalação superior",
+    "Nome do local de instalação superior",
+    "Denominação do equipamento",
+    "Nº série fabricante",
+    "Equipamento superior",
+    "Denominação do equipamento superior",
+    "Ano de construção",
+    "Data de aquisição",
+    "Fabricante do imobilizado"
+  ],
+  "fileName": "Template_VLI Exemplo.xlsx",
+  "sampleData": [
+    {
+      "Equipe": "Portos e Terminais",
+      "Local de instalação \r\nou\r\nEquipamento": "CE-3020-ED02",
+      "Empresa": "VLI Multimodal",
+      "Centro": "PCEM",
+      "Site": "PECEM",
+      "Corredor": "CN",
+      "Município - UF": "São Gonçalo do Amarante - CE",
+      "Denominação do loc.instalação": "PREDIO ALMOXARIFADO - AMRO",
+      "Local de instalação superior": "CE-3020",
+      "Nome do local de instalação superior": "ARMAZENAMENTO INTERNO",
+      "Denominação do equipamento": "BOMBA BHS 522-12 EBARA",
+      "Nº série fabricante": 933921,
+      "Equipamento superior": "FI1010041",
+      "Denominação do equipamento superior": "F8714 A FILTRO TIPO CARTUCHO DO ED8713",
+      "Ano de construção": 1991,
+      "Data de aquisição": 2024,
+      "Fabricante do imobilizado": "DROPSA"
+    }
+  ]
+}

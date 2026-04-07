@@ -1,0 +1,61 @@
+{
+  "entities": {
+    "Config": {
+      "title": "Application Configuration",
+      "description": "Stores the de-para mapping and template information.",
+      "type": "object",
+      "properties": {
+        "referenceColumn": { "type": "string" },
+        "locationId": { "type": "string" },
+        "locationColumn": { "type": "string" },
+        "columnMapping": { "type": "object" },
+        "rawHeaders": { "type": "array", "items": { "type": "string" } },
+        "fileName": { "type": "string" },
+        "sampleData": { "type": "array" },
+        "templateFileBase64": { "type": "string" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "Log": {
+      "title": "Application Log",
+      "description": "Stores system and job logs.",
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "enum": ["info", "success", "error", "warning"] },
+        "message": { "type": "string" },
+        "details": { "type": "object" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      }
+    },
+    "Job": {
+      "title": "Import Job",
+      "description": "Stores the state and progress of an import job.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "running", "paused", "completed", "failed"] },
+        "progress": { "type": "number" },
+        "total": { "type": "number" },
+        "data": { "type": "array" },
+        "config": { "type": "object" },
+        "logs": { "type": "array" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      }
+    }
+  },
+  "firestore": {
+    "/settings/config": {
+      "schema": "Config",
+      "description": "The main application configuration document."
+    },
+    "/logs/{logId}": {
+      "schema": "Log",
+      "description": "Collection of application logs."
+    },
+    "/jobs/{jobId}": {
+      "schema": "Job",
+      "description": "Collection of import jobs."
+    }
+  }
+}

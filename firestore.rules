@@ -1,0 +1,119 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: settings
+    // Document ID: config
+    // Fields:
+    //   - referenceColumn: string (required)
+    //   - locationId: string (required)
+    //   - locationColumn: string (required)
+    //   - columnMapping: map (required)
+    //   - rawHeaders: list (required)
+    //   - fileName: string (required)
+    //   - sampleData: list (required)
+    //   - templateFileBase64: string (required)
+    //   - updatedAt: string (required)
+    //
+    // Collection: logs
+    // Document ID: auto-generated
+    // Fields:
+    //   - type: string (required, enum: info, success, error, warning)
+    //   - message: string (required)
+    //   - details: map (optional)
+    //   - timestamp: timestamp (required)
+    //
+    // Collection: jobs
+    // Document ID: auto-generated (UUID)
+    // Fields:
+    //   - id: string (required)
+    //   - status: string (required, enum: pending, running, paused, completed, failed)
+    //   - progress: number (required)
+    //   - total: number (required)
+    //   - data: list (required)
+    //   - config: map (required)
+    //   - logs: list (required)
+    //   - createdAt: string (required)
+    //   - updatedAt: string (required)
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() &&
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
+          (request.auth.token.email == "martin@biti9.com.br" && request.auth.token.email_verified == true));
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function isValidConfig(data) {
+      return data.referenceColumn is string &&
+             data.locationId is string &&
+             data.locationColumn is string &&
+             data.columnMapping is map &&
+             data.rawHeaders is list &&
+             data.fileName is string &&
+             data.sampleData is list &&
+             data.templateFileBase64 is string &&
+             data.updatedAt is string;
+    }
+
+    function isValidLog(data) {
+      return data.type in ['info', 'success', 'error', 'warning'] &&
+             data.message is string &&
+             data.timestamp is timestamp;
+    }
+
+    function isValidJob(data) {
+      return data.id is string &&
+             data.status in ['pending', 'running', 'paused', 'completed', 'failed'] &&
+             data.progress is number &&
+             data.total is number &&
+             data.data is list &&
+             data.config is map &&
+             data.logs is list &&
+             data.createdAt is string &&
+             data.updatedAt is string;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /settings/config {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin() && isValidConfig(request.resource.data);
+    }
+
+    match /logs/{logId} {
+      allow read: if isAdmin();
+      allow create: if isAuthenticated() && isValidLog(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    match /jobs/{jobId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && isValidJob(request.resource.data);
+      allow update: if isAuthenticated() && isValidJob(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    match /users/{userId} {
+      allow read: if isAuthenticated() && (request.auth.uid == userId || isAdmin());
+      allow write: if isAdmin();
+    }
+  }
+}
