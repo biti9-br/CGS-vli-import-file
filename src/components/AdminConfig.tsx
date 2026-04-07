@@ -197,26 +197,9 @@ export default function AdminConfig({ showModal, showConfirm }: AdminConfigProps
     // Fallback to base64 or CSV generation if server download fails
     if (templateFileBase64) {
       try {
-        // Extract the base64 data part
-        const base64Data = templateFileBase64.split(';base64,').pop();
-        if (!base64Data) throw new Error("Invalid base64 string");
-
-        // Convert base64 to Blob
-        const byteCharacters = atob(base64Data);
-        const byteNumbers = new Array(byteCharacters.length);
-        for (let i = 0; i < byteCharacters.length; i++) {
-          byteNumbers[i] = byteCharacters.charCodeAt(i);
-        }
-        const byteArray = new Uint8Array(byteNumbers);
+        const res = await fetch(templateFileBase64);
+        const blob = await res.blob();
         
-        // Determine mime type from base64 string or default to xlsx
-        let mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
-        const mimeMatch = templateFileBase64.match(/^data:(.*?);base64,/);
-        if (mimeMatch && mimeMatch[1]) {
-          mimeType = mimeMatch[1];
-        }
-
-        const blob = new Blob([byteArray], { type: mimeType });
         const link = document.createElement('a');
         const url = URL.createObjectURL(blob);
         link.href = url;

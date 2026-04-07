@@ -27,10 +27,43 @@ Este projeto é uma automação web desenvolvida para substituir e aprimorar o s
 
 ## Requisitos Técnicos
 
-- Node.js & npm
+- Node.js (v18 ou superior recomendado)
+- npm (gerenciador de pacotes do Node.js)
 - React 19
 - Tailwind CSS 4
 - Bibliotecas principais: `xlsx` (SheetJS), `papaparse`, `lucide-react`
+
+## Como Rodar Localmente
+
+Siga o passo a passo abaixo para rodar o projeto na sua máquina:
+
+1. **Clone o Repositório**:
+   ```bash
+   git clone <sua-url-do-repositorio>
+   cd CGS-vli-import-file
+   ```
+
+2. **Instale as Dependências**:
+   Este é um projeto Node.js e utiliza o `npm` para gerenciar pacotes. Execute o comando abaixo para baixar tudo o que foi listado no `package.json` (você pode verificar os pacotes também no `requirements.txt` gerado):
+   ```bash
+   npm install
+   ```
+
+3. **Configuração de Variáveis de Ambiente**:
+   Crie um arquivo `.env` com base no arquivo de exemplo existente:
+   ```bash
+   cp .env.example .env
+   ```
+   *Certifique-se de preencher as chaves de API e outras configurações no `.env`.*
+
+4. **Inicie o Servidor de Desenvolvimento**:
+   Para iniciar a aplicação frontend e as rotas associadas, digite:
+   ```bash
+   npm run dev
+   ```
+
+5. **Acesso via Navegador**:
+   Acesse no seu navegador a URL informada pelo terminal, geralmente: `http://localhost:5173/`
 
 ## LGPD e Segurança
 
