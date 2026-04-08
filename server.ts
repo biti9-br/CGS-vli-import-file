@@ -70,6 +70,26 @@ async function listJobs(): Promise<Partial<ImportJob>[]> {
 const activeJobs = new Set<string>();
 const stopSignals = new Set<string>();
 
+async function fetchWithRetry(url: string, options: any, retries = 3, backoff = 1000) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const response = await fetch(url, options);
+      if (response.ok) return response;
+      if (response.status >= 500 && i < retries - 1) {
+        // Retry on 5xx errors
+        await new Promise(resolve => setTimeout(resolve, backoff * Math.pow(2, i)));
+        continue;
+      }
+      return response;
+    } catch (error: any) {
+      if (i === retries - 1) throw error;
+      // Retry on network errors
+      await new Promise(resolve => setTimeout(resolve, backoff * Math.pow(2, i)));
+    }
+  }
+  throw new Error('Fetch failed after retries');
+}
+
 async function processJob(jobId: string) {
   if (activeJobs.has(jobId)) return;
   activeJobs.add(jobId);
@@ -112,7 +132,7 @@ async function processJob(jobId: string) {
 
       await addLog('info', `[${i+1}/${job.total}] Chamada API: POST /files`, createPayload);
 
-      const createResponse = await fetch(`https://api.cargosnap.com/api/v2/files?token=${job.config.apiToken}`, {
+      const createResponse = await fetchWithRetry(`https://api.cargosnap.com/api/v2/files?token=${job.config.apiToken}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         body: JSON.stringify(createPayload)
@@ -140,7 +160,7 @@ async function processJob(jobId: string) {
       if (fieldsPayload.length > 0) {
         await addLog('info', `[${i+1}/${job.total}] Chamada API: POST /fields/${row.reference}`, fieldsPayload);
 
-        const fieldsResponse = await fetch(`https://api.cargosnap.com/api/v2/fields/${encodeURIComponent(row.reference)}?token=${job.config.apiToken}`, {
+        const fieldsResponse = await fetchWithRetry(`https://api.cargosnap.com/api/v2/fields/${encodeURIComponent(row.reference)}?token=${job.config.apiToken}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
           body: JSON.stringify(fieldsPayload)
