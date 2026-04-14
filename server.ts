@@ -15,6 +15,22 @@ const JOBS_DIR = path.join(__dirname, "data", "jobs");
 const TEMPLATE_CONFIG_FILE = path.join(__dirname, "template", "template.json");
 const TEMPLATE_XLSX_FILE = path.join(__dirname, "template", "Template Padrão.xlsx");
 
+// ---- Retry helper ----
+// Wraps fetch with exponential backoff retry (2s, 4s) for transient network errors.
+async function fetchWithRetry(url: string, options: RequestInit, retries = 3): Promise<Response> {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await fetch(url, options);
+    } catch (err: any) {
+      if (attempt === retries) throw err;
+      const delay = attempt * 2000;
+      console.warn(`[fetchWithRetry] Tentativa ${attempt}/${retries} falhou. Aguardando ${delay}ms...`, err?.message);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+  throw new Error('Todas as tentativas de fetch falharam');
+}
+
 interface ImportJob {
   id: string;
   status: 'pending' | 'running' | 'paused' | 'completed' | 'failed';
@@ -87,9 +103,14 @@ async function processJob(jobId: string) {
 
   const addLog = async (type: string, message: string, details?: any) => {
     job!.logs.push({ type, message, time: new Date().toLocaleTimeString(), details });
+    // Cap job-level logs at 500 entries to prevent huge JSON files for large imports
+    if (job!.logs.length > 500) {
+      job!.logs = job!.logs.slice(-500);
+    }
     job!.updatedAt = new Date().toISOString();
     await saveJob(job!);
-    await writeLog({ type, message: `[${jobId}] ${message}`, details });
+    // writeLog is now async-buffered; does NOT block the event loop
+    writeLog({ type, message: `[${jobId}] ${message}`, details });
   };
 
   try {
@@ -103,7 +124,7 @@ async function processJob(jobId: string) {
       const row = job.data[i];
       await addLog('info', `[${i+1}/${job.total}] Processando reference: ${row.reference}`);
 
-      // 1. POST /files
+      // 1. POST /files (with retry)
       const createPayload: any = { 
         reference: row.reference,
         close: job.config.closeExisting ? 1 : 0
@@ -112,23 +133,34 @@ async function processJob(jobId: string) {
 
       await addLog('info', `[${i+1}/${job.total}] Chamada API: POST /files`, createPayload);
 
-      const createResponse = await fetch(`https://api.cargosnap.com/api/v2/files?token=${job.config.apiToken}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body: JSON.stringify(createPayload)
-      });
+      let createResponse: Response;
+      try {
+        createResponse = await fetchWithRetry(`https://api.cargosnap.com/api/v2/files?token=${job.config.apiToken}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+          body: JSON.stringify(createPayload)
+        });
+      } catch (fetchErr: any) {
+        await addLog('error', `[${i+1}/${job.total}] Erro de rede ao criar arquivo (pulando registro): ${fetchErr.message}`);
+        job.progress = i + 1;
+        await saveJob(job);
+        await new Promise(resolve => setTimeout(resolve, 500));
+        continue; // Skip this record, do not abort the job
+      }
 
       if (!createResponse.ok) {
         const errorData = await createResponse.json().catch(() => ({}));
-        await addLog('error', `Falha ao criar arquivo: ${createResponse.status}`, errorData);
-        job.status = 'failed';
-        break;
+        await addLog('error', `[${i+1}/${job.total}] Falha ao criar arquivo (pulando registro): ${createResponse.status}`, errorData);
+        job.progress = i + 1;
+        await saveJob(job);
+        await new Promise(resolve => setTimeout(resolve, 500));
+        continue; // Skip this record, do not abort the job
       }
       
       const createData = await createResponse.json().catch(() => ({}));
       await addLog('success', `[${i+1}/${job.total}] Sucesso: POST /files`, createData);
 
-      // 2. POST /fields
+      // 2. POST /fields (with retry)
       const fieldsPayload = Object.keys(row)
         .filter(k => k !== 'reference' && k !== 'location')
         .filter(k => {
@@ -140,26 +172,34 @@ async function processJob(jobId: string) {
       if (fieldsPayload.length > 0) {
         await addLog('info', `[${i+1}/${job.total}] Chamada API: POST /fields/${row.reference}`, fieldsPayload);
 
-        const fieldsResponse = await fetch(`https://api.cargosnap.com/api/v2/fields/${encodeURIComponent(row.reference)}?token=${job.config.apiToken}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-          body: JSON.stringify(fieldsPayload)
-        });
+        let fieldsResponse: Response;
+        try {
+          fieldsResponse = await fetchWithRetry(`https://api.cargosnap.com/api/v2/fields/${encodeURIComponent(row.reference)}?token=${job.config.apiToken}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify(fieldsPayload)
+          });
+        } catch (fetchErr: any) {
+          await addLog('error', `[${i+1}/${job.total}] Erro de rede ao atualizar campos (pulando): ${fetchErr.message}`);
+          job.progress = i + 1;
+          await saveJob(job);
+          await new Promise(resolve => setTimeout(resolve, 500));
+          continue;
+        }
 
         if (!fieldsResponse.ok) {
           const errorData = await fieldsResponse.json().catch(() => ({}));
-          await addLog('error', `Falha ao atualizar campos: ${fieldsResponse.status}`, errorData);
-          job.status = 'failed';
-          break;
+          await addLog('error', `[${i+1}/${job.total}] Falha ao atualizar campos (pulando registro): ${fieldsResponse.status}`, errorData);
+        } else {
+          const fieldsData = await fieldsResponse.json().catch(() => ({}));
+          await addLog('success', `[${i+1}/${job.total}] Sucesso: POST /fields/${row.reference}`, fieldsData);
         }
-        const fieldsData = await fieldsResponse.json().catch(() => ({}));
-        await addLog('success', `[${i+1}/${job.total}] Sucesso: POST /fields/${row.reference}`, fieldsData);
       }
 
       job.progress = i + 1;
       await saveJob(job);
       
-      // Delay de 500ms para respeitar o limite de requisições
+      // Delay de 500ms para respeitar o limite de requisições da API
       await new Promise(resolve => setTimeout(resolve, 500));
     }
 
@@ -197,25 +237,37 @@ async function readLogs() {
   }
 }
 
-async function writeLog(log: any) {
+// ---- Async buffered global log writer ----
+// Accumulates log entries in memory and flushes to disk every 5 seconds.
+// This avoids synchronous 7MB file reads/writes on every loop iteration.
+const _logBuffer: any[] = [];
+let _logFlushScheduled = false;
+
+async function flushGlobalLogs() {
+  _logFlushScheduled = false;
+  if (_logBuffer.length === 0) return;
+  const toFlush = _logBuffer.splice(0, _logBuffer.length);
   try {
-    let logs = [];
+    let existing: any[] = [];
     if (fsSync.existsSync(LOGS_FILE)) {
-      const data = fsSync.readFileSync(LOGS_FILE, 'utf-8');
       try {
-        logs = JSON.parse(data);
-      } catch (e) {
-        console.error('Invalid JSON in logs.json, starting fresh');
-        logs = [];
+        existing = JSON.parse(await fs.readFile(LOGS_FILE, 'utf-8'));
+      } catch {
+        existing = [];
       }
     }
-    logs.unshift({ ...log, timestamp: new Date().toISOString() });
-    if (logs.length > 10000) {
-      logs.length = 10000;
-    }
-    fsSync.writeFileSync(LOGS_FILE, JSON.stringify(logs, null, 2), 'utf-8');
+    const merged = [...toFlush, ...existing].slice(0, 10000);
+    await fs.writeFile(LOGS_FILE, JSON.stringify(merged, null, 2), 'utf-8');
   } catch (error) {
-    console.error('Failed to write log', error);
+    console.error('Failed to flush global logs', error);
+  }
+}
+
+async function writeLog(log: any) {
+  _logBuffer.unshift({ ...log, timestamp: new Date().toISOString() });
+  if (!_logFlushScheduled) {
+    _logFlushScheduled = true;
+    setTimeout(flushGlobalLogs, 5000);
   }
 }
 
@@ -279,12 +331,42 @@ async function deleteConfig() {
   }
 }
 
+// ---- Recover stale jobs after container restart ----
+// If the server restarts while a job was running, reset it to 'paused' so the user can resume.
+async function recoverStaleJobs() {
+  try {
+    await ensureJobsDir();
+    const files = await fs.readdir(JOBS_DIR);
+    for (const file of files) {
+      if (!file.endsWith('.json')) continue;
+      try {
+        const data = await fs.readFile(path.join(JOBS_DIR, file), 'utf-8');
+        const job = JSON.parse(data) as ImportJob;
+        if (job.status === 'running') {
+          job.status = 'paused';
+          job.logs.push({ type: 'info', message: 'Job recuperado após reinício do servidor. Retome manualmente.', time: new Date().toLocaleTimeString() });
+          job.updatedAt = new Date().toISOString();
+          await saveJob(job);
+          console.log(`[Recovery] Job ${job.id} estava em 'running', revertido para 'paused'.`);
+        }
+      } catch (e) {
+        console.error(`[Recovery] Falha ao processar job file: ${file}`, e);
+      }
+    }
+  } catch (e) {
+    console.error('[Recovery] Falha ao recuperar jobs:', e);
+  }
+}
+
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+  // Recover any jobs that were left in 'running' state from a previous server session
+  await recoverStaleJobs();
 
   // Ensure template directory is updated with current config on startup
   try {
@@ -294,10 +376,10 @@ async function startServer() {
       if (currentConfig) {
         // Sync current config to template directory to ensure it persists as the new default
         await writeConfig(currentConfig);
-        await writeLog({ type: 'info', message: 'Configuração atual persistida como novo padrão default no diretório de template.' });
+        writeLog({ type: 'info', message: 'Configuração atual persistida como novo padrão default no diretório de template.' });
       }
     } else {
-      await writeLog({ type: 'info', message: 'Iniciando com configurações padrão do diretório de template.' });
+      writeLog({ type: 'info', message: 'Iniciando com configurações padrão do diretório de template.' });
     }
   } catch (e) {
     console.error('Failed to initialize template from current config', e);
