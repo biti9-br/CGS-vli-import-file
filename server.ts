@@ -5,18 +5,30 @@ import { fileURLToPath } from "url";
 import fs from "fs/promises";
 import fsSync from "fs";
 import crypto from "crypto";
+import { initializeApp, getApps } from "firebase-admin/app";
+import { getFirestore, FieldValue, Timestamp } from "firebase-admin/firestore";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const CONFIG_FILE = path.join(__dirname, "config.json");
-const LOGS_FILE = path.join(__dirname, "logs.json");
-const JOBS_DIR = path.join(__dirname, "data", "jobs");
 const TEMPLATE_CONFIG_FILE = path.join(__dirname, "template", "template.json");
 const TEMPLATE_XLSX_FILE = path.join(__dirname, "template", "Template Padrão.xlsx");
 
+// ---- Firebase Admin ----
+// On Cloud Run, credentials are handled automatically by ADC (Application Default Credentials).
+// Locally, set GOOGLE_APPLICATION_CREDENTIALS to your service account key path.
+if (!getApps().length) {
+  initializeApp({ projectId: process.env.FIREBASE_PROJECT_ID || "cgs-ai" });
+}
+const db = getFirestore();
+
+// Firestore collections
+const jobsCol = db.collection("jobs");
+const payloadsCol = db.collection("payloads");
+const logsCol = db.collection("logs");
+
 // ---- Retry helper ----
-// Wraps fetch with exponential backoff retry (2s, 4s) for transient network errors.
 async function fetchWithRetry(url: string, options: RequestInit, retries = 3): Promise<Response> {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
@@ -28,249 +40,189 @@ async function fetchWithRetry(url: string, options: RequestInit, retries = 3): P
       await new Promise(r => setTimeout(r, delay));
     }
   }
-  throw new Error('Todas as tentativas de fetch falharam');
+  throw new Error("Todas as tentativas de fetch falharam");
 }
 
-interface ImportJob {
-  id: string;
-  status: 'pending' | 'running' | 'paused' | 'completed' | 'failed';
-  progress: number;
-  total: number;
-  data: any[];
-  config: {
-    apiToken: string;
-    closeExisting: boolean;
-  };
-  logs: { type: string; message: string; time: string; details?: any }[];
-  createdAt: string;
-  updatedAt: string;
-}
-
-async function ensureJobsDir() {
-  try {
-    await fs.mkdir(JOBS_DIR, { recursive: true });
-  } catch (e) {}
-}
-
-async function saveJob(job: ImportJob) {
-  await ensureJobsDir();
-  await fs.writeFile(path.join(JOBS_DIR, `${job.id}.json`), JSON.stringify(job, null, 2));
-}
-
-async function getJob(id: string): Promise<ImportJob | null> {
-  try {
-    const data = await fs.readFile(path.join(JOBS_DIR, `${id}.json`), 'utf-8');
-    return JSON.parse(data);
-  } catch (e) {
-    return null;
-  }
-}
-
-async function listJobs(): Promise<Partial<ImportJob>[]> {
-  await ensureJobsDir();
-  const files = await fs.readdir(JOBS_DIR);
-  const jobs = [];
-  for (const file of files) {
-    if (file.endsWith('.json')) {
-      try {
-        const data = await fs.readFile(path.join(JOBS_DIR, file), 'utf-8');
-        const job = JSON.parse(data);
-        const { data: _, ...jobSummary } = job;
-        jobs.push(jobSummary);
-      } catch (e) {}
-    }
-  }
-  return jobs.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-}
-
+// ---- In-memory tracking ----
+// Tokens are never persisted to Firestore — kept only in memory for the active session.
 const activeJobs = new Set<string>();
 const stopSignals = new Set<string>();
+const jobTokens = new Map<string, string>(); // jobId → apiToken
 
+// ---- Log helper ----
+async function writeLog(type: string, message: string, jobId?: string, details?: any) {
+  console.log(`[${type.toUpperCase()}]${jobId ? ` [${jobId}]` : ""} ${message}`);
+  try {
+    const entry: Record<string, any> = {
+      type,
+      message,
+      timestamp: FieldValue.serverTimestamp(),
+    };
+    if (jobId) entry.jobId = jobId;
+    if (details) entry.details = (typeof details === "string" ? details : JSON.stringify(details)).slice(0, 5000);
+    await logsCol.add(entry);
+  } catch (e) {
+    console.error("Failed to write log to Firestore:", e);
+  }
+}
+
+// ---- Helper: convert Firestore Timestamp to ISO string ----
+function tsToIso(val: any): string | null {
+  if (!val) return null;
+  if (val instanceof Timestamp) return val.toDate().toISOString();
+  return String(val);
+}
+
+// ---- Job processor ----
 async function processJob(jobId: string) {
   if (activeJobs.has(jobId)) return;
   activeJobs.add(jobId);
   stopSignals.delete(jobId);
 
-  let job = await getJob(jobId);
-  if (!job) {
+  const jobRef = jobsCol.doc(jobId);
+  const apiToken = jobTokens.get(jobId);
+
+  if (!apiToken) {
+    console.error(`[processJob] Token não encontrado para job ${jobId}. Pausando.`);
+    await jobRef.update({ status: "paused", updatedAt: FieldValue.serverTimestamp() });
     activeJobs.delete(jobId);
     return;
   }
 
-  job.status = 'running';
-  job.updatedAt = new Date().toISOString();
-  await saveJob(job);
-
-  const addLog = async (type: string, message: string, details?: any) => {
-    job!.logs.push({ type, message, time: new Date().toLocaleTimeString(), details });
-    // Cap job-level logs at 500 entries to prevent huge JSON files for large imports
-    if (job!.logs.length > 500) {
-      job!.logs = job!.logs.slice(-500);
-    }
-    job!.updatedAt = new Date().toISOString();
-    await saveJob(job!);
-    // writeLog is now async-buffered; does NOT block the event loop
-    writeLog({ type, message: `[${jobId}] ${message}`, details });
-  };
-
   try {
-    for (let i = job.progress; i < job.data.length; i++) {
-      if (stopSignals.has(jobId)) {
-        job.status = 'paused';
-        await addLog('info', 'Importação interrompida pelo usuário.');
-        break;
-      }
+    const jobSnap = await jobRef.get();
+    if (!jobSnap.exists) { activeJobs.delete(jobId); return; }
 
-      const row = job.data[i];
-      await addLog('info', `[${i+1}/${job.total}] Processando reference: ${row.reference}`);
+    const { closeExisting } = jobSnap.data()!;
 
-      // 1. POST /files (with retry)
-      const createPayload: any = { 
-        reference: row.reference,
-        close: job.config.closeExisting ? 1 : 0
-      };
-      if (row.location) createPayload.location_id = row.location;
+    await jobRef.update({ status: "running", updatedAt: FieldValue.serverTimestamp() });
+    await writeLog("info", "Processamento iniciado.", jobId);
 
-      await addLog('info', `[${i+1}/${job.total}] Chamada API: POST /files`, createPayload);
+    // Fetch all pending payloads for this job, ordered by rowIndex
+    const pendingSnap = await payloadsCol
+      .where("jobId", "==", jobId)
+      .where("status", "==", "pending")
+      .orderBy("rowIndex")
+      .get();
 
-      let createResponse: Response;
-      try {
-        createResponse = await fetchWithRetry(`https://api.cargosnap.com/api/v2/files?token=${job.config.apiToken}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-          body: JSON.stringify(createPayload)
-        });
-      } catch (fetchErr: any) {
-        await addLog('error', `[${i+1}/${job.total}] Erro de rede ao criar arquivo (pulando registro): ${fetchErr.message}`);
-        job.progress = i + 1;
-        await saveJob(job);
-        await new Promise(resolve => setTimeout(resolve, 500));
-        continue; // Skip this record, do not abort the job
-      }
-
-      if (!createResponse.ok) {
-        const errorData = await createResponse.json().catch(() => ({}));
-        await addLog('error', `[${i+1}/${job.total}] Falha ao criar arquivo (pulando registro): ${createResponse.status}`, errorData);
-        job.progress = i + 1;
-        await saveJob(job);
-        await new Promise(resolve => setTimeout(resolve, 500));
-        continue; // Skip this record, do not abort the job
-      }
-      
-      const createData = await createResponse.json().catch(() => ({}));
-      await addLog('success', `[${i+1}/${job.total}] Sucesso: POST /files`, createData);
-
-      // 2. POST /fields (with retry)
-      const fieldsPayload = Object.keys(row)
-        .filter(k => k !== 'reference' && k !== 'location')
-        .filter(k => {
-          const val = row[k];
-          return val !== null && val !== undefined && String(val).trim() !== "";
-        })
-        .map(k => ({ id: k, value: row[k] }));
-
-      if (fieldsPayload.length > 0) {
-        await addLog('info', `[${i+1}/${job.total}] Chamada API: POST /fields/${row.reference}`, fieldsPayload);
-
-        let fieldsResponse: Response;
-        try {
-          fieldsResponse = await fetchWithRetry(`https://api.cargosnap.com/api/v2/fields/${encodeURIComponent(row.reference)}?token=${job.config.apiToken}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-            body: JSON.stringify(fieldsPayload)
-          });
-        } catch (fetchErr: any) {
-          await addLog('error', `[${i+1}/${job.total}] Erro de rede ao atualizar campos (pulando): ${fetchErr.message}`);
-          job.progress = i + 1;
-          await saveJob(job);
-          await new Promise(resolve => setTimeout(resolve, 500));
-          continue;
-        }
-
-        if (!fieldsResponse.ok) {
-          const errorData = await fieldsResponse.json().catch(() => ({}));
-          await addLog('error', `[${i+1}/${job.total}] Falha ao atualizar campos (pulando registro): ${fieldsResponse.status}`, errorData);
-        } else {
-          const fieldsData = await fieldsResponse.json().catch(() => ({}));
-          await addLog('success', `[${i+1}/${job.total}] Sucesso: POST /fields/${row.reference}`, fieldsData);
-        }
-      }
-
-      job.progress = i + 1;
-      await saveJob(job);
-      
-      // Delay de 500ms para respeitar o limite de requisições da API
-      await new Promise(resolve => setTimeout(resolve, 500));
+    if (pendingSnap.empty) {
+      await jobRef.update({ status: "completed", updatedAt: FieldValue.serverTimestamp() });
+      await writeLog("success", "Nenhum payload pendente. Job concluído.", jobId);
+      return;
     }
 
-    if (job.progress === job.total && job.status !== 'failed') {
-      job.status = 'completed';
-      await addLog('success', 'Importação concluída com sucesso!');
+    let processed = 0;
+    const total = pendingSnap.size;
+
+    for (const doc of pendingSnap.docs) {
+      // Check for stop signal
+      if (stopSignals.has(jobId)) {
+        await jobRef.update({ status: "paused", updatedAt: FieldValue.serverTimestamp() });
+        await writeLog("info", `Pausado após ${processed}/${total} registros.`, jobId);
+        return;
+      }
+
+      const payload = doc.data();
+      const label = `[${payload.rowIndex + 1}] ${payload.reference}`;
+      let rowOk = false;
+
+      // Step 1: POST /files
+      try {
+        const body: Record<string, any> = {
+          reference: payload.reference,
+          close: closeExisting ? 1 : 0,
+        };
+        if (payload.locationId) body.location_id = payload.locationId;
+
+        const res = await fetchWithRetry(
+          `https://api.cargosnap.com/api/v2/files?token=${apiToken}`,
+          { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify(body) }
+        );
+
+        if (res.ok) {
+          rowOk = true;
+        } else {
+          const errData = await res.json().catch(() => ({}));
+          await doc.ref.update({ status: "error", errorMessage: `POST /files ${res.status}`, sentAt: FieldValue.serverTimestamp() });
+          await writeLog("error", `${label} Falha POST /files: ${res.status}`, jobId, errData);
+        }
+      } catch (e: any) {
+        await doc.ref.update({ status: "error", errorMessage: e.message, sentAt: FieldValue.serverTimestamp() });
+        await writeLog("error", `${label} Erro de rede: ${e.message}`, jobId);
+      }
+
+      // Step 2: POST /fields (only if /files succeeded and fields exist)
+      if (rowOk && payload.fields && Object.keys(payload.fields).length > 0) {
+        const fieldsBody = Object.entries(payload.fields).map(([id, value]) => ({ id, value }));
+        try {
+          const res = await fetchWithRetry(
+            `https://api.cargosnap.com/api/v2/fields/${encodeURIComponent(payload.reference)}?token=${apiToken}`,
+            { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify(fieldsBody) }
+          );
+
+          if (res.ok) {
+            await doc.ref.update({ status: "sent", errorMessage: null, sentAt: FieldValue.serverTimestamp() });
+          } else {
+            const errData = await res.json().catch(() => ({}));
+            await doc.ref.update({ status: "error", errorMessage: `POST /fields ${res.status}`, sentAt: FieldValue.serverTimestamp() });
+            await writeLog("error", `${label} Falha POST /fields: ${res.status}`, jobId, errData);
+          }
+        } catch (e: any) {
+          await doc.ref.update({ status: "error", errorMessage: e.message, sentAt: FieldValue.serverTimestamp() });
+          await writeLog("error", `${label} Erro de rede /fields: ${e.message}`, jobId);
+        }
+      } else if (rowOk) {
+        // No fields configured, mark as sent
+        await doc.ref.update({ status: "sent", errorMessage: null, sentAt: FieldValue.serverTimestamp() });
+      }
+
+      processed++;
+      await jobRef.update({ progress: FieldValue.increment(1), updatedAt: FieldValue.serverTimestamp() });
+
+      // Log progress every 100 records
+      if (processed % 100 === 0) {
+        await writeLog("info", `${processed}/${total} registros processados.`, jobId);
+      }
+
+      // Rate limiting: 500ms between API calls
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    // Verify all done
+    const remaining = await payloadsCol
+      .where("jobId", "==", jobId)
+      .where("status", "==", "pending")
+      .limit(1)
+      .get();
+
+    if (remaining.empty) {
+      await jobRef.update({ status: "completed", updatedAt: FieldValue.serverTimestamp() });
+      await writeLog("success", `Importação concluída! ${processed} registros enviados.`, jobId);
     }
   } catch (error: any) {
-    job.status = 'failed';
-    await addLog('error', `Erro interno durante o processamento: ${error.message}`, error.stack);
+    try { await jobRef.update({ status: "failed", updatedAt: FieldValue.serverTimestamp() }); } catch {}
+    await writeLog("error", `Erro interno: ${error.message}`, jobId, error.stack);
   } finally {
     activeJobs.delete(jobId);
     stopSignals.delete(jobId);
-    await saveJob(job!);
+    jobTokens.delete(jobId);
   }
 }
 
-async function readLogs() {
+// ---- Startup: recover jobs stuck in 'running' after container restart ----
+async function recoverStaleJobs() {
   try {
-    if (!fsSync.existsSync(LOGS_FILE)) {
-      return [];
+    const snap = await jobsCol.where("status", "==", "running").get();
+    for (const doc of snap.docs) {
+      await doc.ref.update({ status: "paused", updatedAt: FieldValue.serverTimestamp() });
+      console.log(`[Recovery] Job ${doc.id} revertido para paused.`);
     }
-    const data = await fs.readFile(LOGS_FILE, "utf-8");
-    try {
-      return JSON.parse(data);
-    } catch (e) {
-      console.error('Invalid JSON in logs.json, returning empty array');
-      return [];
-    }
-  } catch (error: any) {
-    if (error.code === "ENOENT") {
-      return [];
-    }
-    throw error;
+  } catch (e) {
+    console.error("[Recovery] Falha:", e);
   }
 }
 
-// ---- Async buffered global log writer ----
-// Accumulates log entries in memory and flushes to disk every 5 seconds.
-// This avoids synchronous 7MB file reads/writes on every loop iteration.
-const _logBuffer: any[] = [];
-let _logFlushScheduled = false;
-
-async function flushGlobalLogs() {
-  _logFlushScheduled = false;
-  if (_logBuffer.length === 0) return;
-  const toFlush = _logBuffer.splice(0, _logBuffer.length);
-  try {
-    let existing: any[] = [];
-    if (fsSync.existsSync(LOGS_FILE)) {
-      try {
-        existing = JSON.parse(await fs.readFile(LOGS_FILE, 'utf-8'));
-      } catch {
-        existing = [];
-      }
-    }
-    const merged = [...toFlush, ...existing].slice(0, 10000);
-    await fs.writeFile(LOGS_FILE, JSON.stringify(merged, null, 2), 'utf-8');
-  } catch (error) {
-    console.error('Failed to flush global logs', error);
-  }
-}
-
-async function writeLog(log: any) {
-  _logBuffer.unshift({ ...log, timestamp: new Date().toISOString() });
-  if (!_logFlushScheduled) {
-    _logFlushScheduled = true;
-    setTimeout(flushGlobalLogs, 5000);
-  }
-}
-
+// ---- Config helpers (file-based — settings not migrated yet) ----
 async function readConfig() {
   try {
     const data = await fs.readFile(CONFIG_FILE, "utf-8");
@@ -282,12 +234,10 @@ async function readConfig() {
         const config = JSON.parse(templateData);
         try {
           const xlsxBuffer = await fs.readFile(TEMPLATE_XLSX_FILE);
-          config.templateFileBase64 = `data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${xlsxBuffer.toString('base64')}`;
-        } catch (e) {
-          // ignore if xlsx not found
-        }
+          config.templateFileBase64 = `data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${xlsxBuffer.toString("base64")}`;
+        } catch {}
         return config;
-      } catch (e) {
+      } catch {
         return null;
       }
     }
@@ -296,28 +246,18 @@ async function readConfig() {
 }
 
 async function writeConfig(config: any) {
-  // Save to main config file
   await fs.writeFile(CONFIG_FILE, JSON.stringify(config, null, 2), "utf-8");
-  
-  // Also update the template directory to make it the new default
   try {
     const templateDir = path.join(__dirname, "template");
     await fs.mkdir(templateDir, { recursive: true });
-    
-    // Create a copy of config without the base64 file for the template config
     const { templateFileBase64, ...templateConfig } = config;
     await fs.writeFile(TEMPLATE_CONFIG_FILE, JSON.stringify(templateConfig, null, 2), "utf-8");
-    
-    // If there's a template file, save it as the new default XLSX
     if (templateFileBase64) {
-      const base64Data = templateFileBase64.split(';base64,').pop();
-      if (base64Data) {
-        await fs.writeFile(TEMPLATE_XLSX_FILE, Buffer.from(base64Data, 'base64'));
-      }
+      const base64Data = templateFileBase64.split(";base64,").pop();
+      if (base64Data) await fs.writeFile(TEMPLATE_XLSX_FILE, Buffer.from(base64Data, "base64"));
     }
-  } catch (error) {
-    console.error('Failed to update template directory', error);
-    // We don't throw here to avoid failing the main config save
+  } catch (e) {
+    console.error("Failed to update template directory:", e);
   }
 }
 
@@ -325,328 +265,351 @@ async function deleteConfig() {
   try {
     await fs.unlink(CONFIG_FILE);
   } catch (error: any) {
-    if (error.code !== "ENOENT") {
-      throw error;
-    }
+    if (error.code !== "ENOENT") throw error;
   }
 }
 
-// ---- Recover stale jobs after container restart ----
-// If the server restarts while a job was running, reset it to 'paused' so the user can resume.
-async function recoverStaleJobs() {
-  try {
-    await ensureJobsDir();
-    const files = await fs.readdir(JOBS_DIR);
-    for (const file of files) {
-      if (!file.endsWith('.json')) continue;
-      try {
-        const data = await fs.readFile(path.join(JOBS_DIR, file), 'utf-8');
-        const job = JSON.parse(data) as ImportJob;
-        if (job.status === 'running') {
-          job.status = 'paused';
-          job.logs.push({ type: 'info', message: 'Job recuperado após reinício do servidor. Retome manualmente.', time: new Date().toLocaleTimeString() });
-          job.updatedAt = new Date().toISOString();
-          await saveJob(job);
-          console.log(`[Recovery] Job ${job.id} estava em 'running', revertido para 'paused'.`);
-        }
-      } catch (e) {
-        console.error(`[Recovery] Falha ao processar job file: ${file}`, e);
-      }
-    }
-  } catch (e) {
-    console.error('[Recovery] Falha ao recuperar jobs:', e);
+// ---- Batch delete helper ----
+async function batchDelete(query: FirebaseFirestore.Query) {
+  let snap = await query.limit(500).get();
+  while (!snap.empty) {
+    const batch = db.batch();
+    snap.docs.forEach(d => batch.delete(d.ref));
+    await batch.commit();
+    snap = await query.limit(500).get();
   }
 }
 
+// ---- Server ----
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
-  app.use(express.json({ limit: '50mb' }));
-  app.use(express.urlencoded({ limit: '50mb', extended: true }));
+  app.use(express.json({ limit: "50mb" }));
+  app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
-  // Recover any jobs that were left in 'running' state from a previous server session
   await recoverStaleJobs();
 
-  // Ensure template directory is updated with current config on startup
+  // Sync config to template on startup
   try {
-    const configExists = fsSync.existsSync(CONFIG_FILE);
-    if (configExists) {
-      const currentConfig = await readConfig();
-      if (currentConfig) {
-        // Sync current config to template directory to ensure it persists as the new default
-        await writeConfig(currentConfig);
-        writeLog({ type: 'info', message: 'Configuração atual persistida como novo padrão default no diretório de template.' });
-      }
-    } else {
-      writeLog({ type: 'info', message: 'Iniciando com configurações padrão do diretório de template.' });
+    if (fsSync.existsSync(CONFIG_FILE)) {
+      const cfg = await readConfig();
+      if (cfg) await writeConfig(cfg);
     }
   } catch (e) {
-    console.error('Failed to initialize template from current config', e);
+    console.error("Failed to sync config on startup:", e);
   }
 
-  // Dynamic Environment Variables Injection
+  // ---- Dynamic env injection (for frontend) ----
   app.get("/env-config.js", (req, res) => {
     const env = {
       GEMINI_API_KEY: process.env.GEMINI_API_KEY || "",
       MY_APP_URL: process.env.MY_APP_URL || "",
+      FIREBASE_API_KEY: process.env.FIREBASE_API_KEY || "",
+      FIREBASE_AUTH_DOMAIN: process.env.FIREBASE_AUTH_DOMAIN || "",
+      FIREBASE_PROJECT_ID: process.env.FIREBASE_PROJECT_ID || "",
+      FIREBASE_STORAGE_BUCKET: process.env.FIREBASE_STORAGE_BUCKET || "",
+      FIREBASE_MESSAGING_SENDER_ID: process.env.FIREBASE_MESSAGING_SENDER_ID || "",
+      FIREBASE_APP_ID: process.env.FIREBASE_APP_ID || "",
     };
     res.type("application/javascript");
     res.send(`window.ENV = ${JSON.stringify(env)};`);
   });
 
-  // API Routes
+  // ---- Config API ----
   app.get("/api/config", async (req, res) => {
     try {
-      const config = await readConfig();
-      res.json(config);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  app.get("/api/template/download", async (req, res) => {
-    try {
-      // Check if the template file exists
-      try {
-        await fs.access(TEMPLATE_XLSX_FILE);
-        res.download(TEMPLATE_XLSX_FILE, "Template_Padrao.xlsx");
-      } catch (e) {
-        res.status(404).json({ error: "Template file not found" });
-      }
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      res.json(await readConfig());
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
     }
   });
 
   app.post("/api/config", async (req, res) => {
     try {
       const { referenceColumn, locationId, locationColumn, columnMapping, rawHeaders, fileName, sampleData, templateFileBase64 } = req.body;
-      
-      const config = {
-        referenceColumn,
-        locationId,
-        locationColumn,
-        columnMapping,
-        rawHeaders,
-        fileName,
-        sampleData,
-        templateFileBase64,
-        updatedAt: new Date().toISOString()
-      };
-
+      const config = { referenceColumn, locationId, locationColumn, columnMapping, rawHeaders, fileName, sampleData, templateFileBase64, updatedAt: new Date().toISOString() };
       await writeConfig(config);
-      await writeLog({ type: 'info', message: `Configuração do sistema atualizada pelo administrador (Reference: ${referenceColumn}).`, details: req.body });
+      await writeLog("info", `Configuração atualizada (reference: ${referenceColumn}).`);
       res.json({ success: true });
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
     }
   });
 
   app.delete("/api/config", async (req, res) => {
     try {
       await deleteConfig();
-      await writeLog({ type: 'info', message: 'Configuração do sistema removida pelo administrador.' });
+      await writeLog("info", "Configuração removida pelo administrador.");
       res.json({ success: true });
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
     }
   });
 
-  // Logs API
+  app.get("/api/template/download", async (req, res) => {
+    try {
+      await fs.access(TEMPLATE_XLSX_FILE);
+      res.download(TEMPLATE_XLSX_FILE, "Template_Padrao.xlsx");
+    } catch {
+      res.status(404).json({ error: "Template file not found" });
+    }
+  });
+
+  // ---- Logs API (Firestore) ----
   app.get("/api/logs", async (req, res) => {
     try {
-      const logs = await readLogs();
+      const snap = await logsCol.orderBy("timestamp", "desc").limit(1000).get();
+      const logs = snap.docs.map(d => ({
+        id: d.id,
+        ...d.data(),
+        timestamp: tsToIso(d.data().timestamp),
+      }));
       res.json(logs);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
     }
   });
 
   app.post("/api/logs", async (req, res) => {
     try {
-      await writeLog(req.body);
+      await writeLog(req.body.type || "info", req.body.message || "", req.body.jobId, req.body.details);
       res.json({ success: true });
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
     }
   });
 
   app.delete("/api/logs", async (req, res) => {
     try {
-      await fs.writeFile(LOGS_FILE, JSON.stringify([], null, 2), 'utf-8');
-      await writeLog({ type: 'info', message: 'Histórico de logs limpo pelo administrador.' });
+      await batchDelete(logsCol as any);
       res.json({ success: true });
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
     }
   });
 
-  // Job Manager Endpoints
+  // ---- Jobs API (Firestore) ----
+
+  // Create job + payloads
   app.post("/api/jobs", async (req, res) => {
     try {
-      const { data, config } = req.body;
+      const { data, config } = req.body as { data: any[]; config: { apiToken: string; closeExisting: boolean } };
+      if (!data?.length) return res.status(400).json({ error: "data array is required" });
+
       const id = crypto.randomUUID();
-      const job: ImportJob = {
-        id,
-        status: 'pending',
+      const jobRef = jobsCol.doc(id);
+
+      // Create job document (token NOT stored in Firestore)
+      await jobRef.set({
+        status: "pending",
         progress: 0,
         total: data.length,
-        data,
-        config,
-        logs: [{ type: 'info', message: 'Job criado na fila.', time: new Date().toLocaleTimeString() }],
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-      };
-      await saveJob(job);
-      await writeLog({ type: 'info', message: `Nova importação iniciada: Job ${id} com ${data.length} registros.` });
-      
-      // Start processing asynchronously
+        closeExisting: config.closeExisting ?? false,
+        fileName: "",
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+
+      // Store token in memory only
+      jobTokens.set(id, config.apiToken);
+
+      // Create payload documents in batches of 500
+      const BATCH_SIZE = 500;
+      for (let i = 0; i < data.length; i += BATCH_SIZE) {
+        const batch = db.batch();
+        data.slice(i, i + BATCH_SIZE).forEach((row: any, idx: number) => {
+          const { reference, location, ...fields } = row;
+          // Filter out empty fields
+          const cleanFields: Record<string, string> = {};
+          Object.entries(fields).forEach(([k, v]) => {
+            if (v !== null && v !== undefined && String(v).trim() !== "") {
+              cleanFields[k] = String(v).trim();
+            }
+          });
+          batch.set(payloadsCol.doc(), {
+            jobId: id,
+            rowIndex: i + idx,
+            reference: String(reference || ""),
+            locationId: String(location || ""),
+            fields: cleanFields,
+            status: "pending",
+            errorMessage: null,
+            sentAt: null,
+            createdAt: FieldValue.serverTimestamp(),
+          });
+        });
+        await batch.commit();
+      }
+
+      await writeLog("info", `Job ${id} criado com ${data.length} registros.`, id);
       processJob(id).catch(console.error);
-      
       res.json({ id });
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
     }
   });
 
+  // List jobs
   app.get("/api/jobs", async (req, res) => {
     try {
-      const jobs = await listJobs();
+      const snap = await jobsCol.orderBy("createdAt", "desc").limit(50).get();
+      const jobs = snap.docs.map(d => {
+        const data = d.data();
+        return {
+          id: d.id,
+          status: data.status,
+          progress: data.progress,
+          total: data.total,
+          closeExisting: data.closeExisting,
+          fileName: data.fileName,
+          createdAt: tsToIso(data.createdAt),
+          updatedAt: tsToIso(data.updatedAt),
+        };
+      });
       res.json(jobs);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
     }
   });
 
-  app.delete("/api/jobs/:id", async (req, res) => {
-    try {
-      const id = req.params.id;
-      const jobPath = path.join(JOBS_DIR, `${id}.json`);
-      if (activeJobs.has(id)) {
-        return res.status(400).json({ error: 'Cannot delete a running job' });
-      }
-      await fs.unlink(jobPath);
-      await writeLog({ type: 'info', message: `Importação excluída pelo usuário: Job ${id}` });
-      res.json({ success: true });
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
+  // Get job details + logs
   app.get("/api/jobs/:id", async (req, res) => {
     try {
-      const job = await getJob(req.params.id);
-      if (!job) return res.status(404).json({ error: 'Job not found' });
-      const { data, ...jobDetails } = job;
-      res.json(jobDetails);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      const snap = await jobsCol.doc(req.params.id).get();
+      if (!snap.exists) return res.status(404).json({ error: "Job not found" });
+
+      const data = snap.data()!;
+
+      // Fetch last 200 logs for this job
+      const logsSnap = await logsCol
+        .where("jobId", "==", req.params.id)
+        .orderBy("timestamp", "desc")
+        .limit(200)
+        .get();
+
+      const logs = logsSnap.docs.map(d => ({
+        type: d.data().type,
+        message: d.data().message,
+        time: (d.data().timestamp instanceof Timestamp)
+          ? d.data().timestamp.toDate().toLocaleTimeString("pt-BR")
+          : "",
+      }));
+
+      res.json({
+        id: snap.id,
+        status: data.status,
+        progress: data.progress,
+        total: data.total,
+        closeExisting: data.closeExisting,
+        fileName: data.fileName,
+        createdAt: tsToIso(data.createdAt),
+        updatedAt: tsToIso(data.updatedAt),
+        logs,
+      });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
     }
   });
 
+  // Stop job
   app.post("/api/jobs/:id/stop", async (req, res) => {
     try {
-      const job = await getJob(req.params.id);
-      if (!job) return res.status(404).json({ error: 'Job not found' });
-      
-      if (job.status === 'running' || job.status === 'pending') {
-        stopSignals.add(job.id);
-        if (!activeJobs.has(job.id)) {
-          job.status = 'paused';
-          job.logs.push({ type: 'info', message: 'Importação pausada pelo usuário.', time: new Date().toLocaleTimeString() });
-          await saveJob(job);
-        }
-        await writeLog({ type: 'info', message: `Importação pausada pelo usuário: Job ${job.id}` });
+      const { id } = req.params;
+      stopSignals.add(id);
+      if (!activeJobs.has(id)) {
+        await jobsCol.doc(id).update({ status: "paused", updatedAt: FieldValue.serverTimestamp() });
       }
+      await writeLog("info", "Importação pausada pelo usuário.", id);
       res.json({ success: true });
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
     }
   });
 
+  // Resume job — requires apiToken in body since token is not stored in Firestore
   app.post("/api/jobs/:id/resume", async (req, res) => {
     try {
-      const job = await getJob(req.params.id);
-      if (!job) return res.status(404).json({ error: 'Job not found' });
-      
-      if (job.status === 'paused' || job.status === 'failed') {
-        job.status = 'pending';
-        job.logs.push({ type: 'info', message: 'Retomando importação...', time: new Date().toLocaleTimeString() });
-        await saveJob(job);
-        await writeLog({ type: 'info', message: `Importação retomada pelo usuário: Job ${job.id}` });
-        processJob(job.id).catch(console.error);
+      const { id } = req.params;
+      const snap = await jobsCol.doc(id).get();
+      if (!snap.exists) return res.status(404).json({ error: "Job not found" });
+
+      const { status } = snap.data()!;
+      if (status !== "paused" && status !== "failed") {
+        return res.status(400).json({ error: `Job status is '${status}', cannot resume.` });
       }
+
+      const apiToken = req.body.apiToken || jobTokens.get(id);
+      if (!apiToken) {
+        return res.status(400).json({ error: "apiToken required to resume. Token not stored for security." });
+      }
+
+      jobTokens.set(id, apiToken);
+      await snap.ref.update({ status: "pending", updatedAt: FieldValue.serverTimestamp() });
+      await writeLog("info", "Retomando importação...", id);
+      processJob(id).catch(console.error);
       res.json({ success: true });
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
     }
   });
 
-  // CargoSnap API Proxies
+  // Delete job (and its payloads + logs)
+  app.delete("/api/jobs/:id", async (req, res) => {
+    try {
+      const { id } = req.params;
+      if (activeJobs.has(id)) return res.status(400).json({ error: "Cannot delete a running job" });
+
+      await Promise.all([
+        batchDelete(payloadsCol.where("jobId", "==", id) as any),
+        batchDelete(logsCol.where("jobId", "==", id) as any),
+      ]);
+      await jobsCol.doc(id).delete();
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ---- CargoSnap proxy endpoints (unchanged) ----
   app.post("/api/cargosnap/files", async (req, res) => {
     try {
-      const authHeader = req.headers.authorization || "";
-      const token = authHeader.replace("Bearer ", "").trim();
+      const token = (req.headers.authorization || "").replace("Bearer ", "").trim();
       const url = token ? `https://api.cargosnap.com/api/v2/files?token=${token}` : "https://api.cargosnap.com/api/v2/files";
-
-      const response = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Accept": "application/json"
-        },
-        body: JSON.stringify(req.body)
-      });
-      const data = await response.json().catch(() => ({}));
-      res.status(response.status).json(data);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify(req.body) });
+      res.status(response.status).json(await response.json().catch(() => ({})));
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
     }
   });
 
   app.post("/api/cargosnap/fields/:reference", async (req, res) => {
     try {
       const { reference } = req.params;
-      const authHeader = req.headers.authorization || "";
-      const token = authHeader.replace("Bearer ", "").trim();
-      const url = token 
-        ? `https://api.cargosnap.com/api/v2/fields/${encodeURIComponent(reference)}?token=${token}` 
+      const token = (req.headers.authorization || "").replace("Bearer ", "").trim();
+      const url = token
+        ? `https://api.cargosnap.com/api/v2/fields/${encodeURIComponent(reference)}?token=${token}`
         : `https://api.cargosnap.com/api/v2/fields/${encodeURIComponent(reference)}`;
-
-      const response = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Accept": "application/json"
-        },
-        body: JSON.stringify(req.body)
-      });
-      const data = await response.json().catch(() => ({}));
-      res.status(response.status).json(data);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
+      const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify(req.body) });
+      res.status(response.status).json(await response.json().catch(() => ({})));
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
     }
   });
 
-  // Vite middleware for development
+  // ---- Frontend serving ----
   if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
+    app.get("*", (req, res) => res.sendFile(path.join(distPath, "index.html")));
   }
 
   app.listen(PORT, "0.0.0.0", async () => {
     console.log(`Server running on http://localhost:${PORT}`);
-    await writeLog({ type: 'info', message: 'Servidor iniciado e pronto para operações.' });
+    await writeLog("info", "Servidor iniciado e pronto para operações.");
   });
 }
 

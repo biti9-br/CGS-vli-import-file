@@ -21,6 +21,8 @@ export default function JobsDashboard({ showModal, showConfirm }: JobsDashboardP
   const [selectedJob, setSelectedJob] = useState<string | null>(null);
   const [jobDetails, setJobDetails] = useState<any>(null);
   const [isDeleting, setIsDeleting] = useState(false);
+  // Resume token prompt: { jobId, token }
+  const [resumePrompt, setResumePrompt] = useState<{ jobId: string; token: string } | null>(null);
 
   const fetchJobs = async () => {
     try {
@@ -63,9 +65,31 @@ export default function JobsDashboard({ showModal, showConfirm }: JobsDashboardP
     fetchJobs();
   };
 
-  const handleResume = async (id: string) => {
-    await fetch(`/api/jobs/${id}/resume`, { method: 'POST' });
-    fetchJobs();
+  const handleResume = (id: string) => {
+    // Token is never stored in Firestore — user must provide it again to resume
+    setResumePrompt({ jobId: id, token: '' });
+  };
+
+  const confirmResume = async () => {
+    if (!resumePrompt) return;
+    if (!resumePrompt.token.trim()) {
+      showModal('Atenção', 'Insira o API Token para retomar a importação.', 'error');
+      return;
+    }
+    try {
+      const res = await fetch(`/api/jobs/${resumePrompt.jobId}/resume`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apiToken: resumePrompt.token.trim() }),
+      });
+      if (!res.ok) throw new Error((await res.json()).error || 'Erro ao retomar');
+      showModal('Sucesso', 'Importação retomada com sucesso.', 'success');
+      fetchJobs();
+    } catch (e: any) {
+      showModal('Erro', e.message, 'error');
+    } finally {
+      setResumePrompt(null);
+    }
   };
 
   const handleDelete = async (id: string) => {
@@ -239,6 +263,41 @@ export default function JobsDashboard({ showModal, showConfirm }: JobsDashboardP
       {isDeleting && (
         <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-[60] flex items-center justify-center">
           <RefreshCw className="animate-spin text-white" size={32} />
+        </div>
+      )}
+
+      {/* Resume token prompt */}
+      {resumePrompt && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-[70] flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-xl max-w-sm w-full p-6 animate-in fade-in zoom-in-95 duration-200">
+            <h3 className="text-lg font-semibold text-slate-800 mb-1">Retomar Importação</h3>
+            <p className="text-sm text-slate-500 mb-4">
+              O token de API não é armazenado por segurança. Insira-o novamente para retomar.
+            </p>
+            <input
+              type="password"
+              placeholder="API Token do Cargosnap"
+              className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 outline-none mb-4"
+              value={resumePrompt.token}
+              onChange={e => setResumePrompt(p => p ? { ...p, token: e.target.value } : null)}
+              onKeyDown={e => e.key === 'Enter' && confirmResume()}
+              autoFocus
+            />
+            <div className="flex gap-3 justify-end">
+              <button
+                onClick={() => setResumePrompt(null)}
+                className="px-4 py-2 text-slate-600 hover:bg-slate-100 rounded-lg text-sm font-medium transition-colors"
+              >
+                Cancelar
+              </button>
+              <button
+                onClick={confirmResume}
+                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-sm font-medium transition-colors"
+              >
+                Retomar
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
