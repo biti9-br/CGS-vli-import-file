@@ -46,9 +46,14 @@ export default function JobsDashboard({ showModal, showConfirm }: JobsDashboardP
     try {
       const res = await fetch(`/api/jobs/${id}`);
       const data = await res.json();
-      setJobDetails(data);
-    } catch (e) {
-      console.error('Failed to fetch job details', e);
+      if (!res.ok) {
+        // Surface server error in the log panel
+        setJobDetails({ logs: [], _logsError: data.error || `HTTP ${res.status}` });
+      } else {
+        setJobDetails(data);
+      }
+    } catch (e: any) {
+      setJobDetails({ logs: [], _logsError: `Erro de rede: ${e.message}` });
     }
   };
 
@@ -244,6 +249,12 @@ export default function JobsDashboard({ showModal, showConfirm }: JobsDashboardP
                     </div>
                     
                     <div className="flex-1 overflow-y-auto font-mono text-xs space-y-1.5 pr-2 custom-scrollbar">
+                      {/* Diagnostic error from server */}
+                      {jobDetails._logsError && (
+                        <div className="text-amber-400 bg-amber-950/30 p-2 rounded mb-2">
+                          <span className="font-bold">[DIAGNÓSTICO]</span> Erro ao buscar logs: {jobDetails._logsError}
+                        </div>
+                      )}
                       {jobDetails.logs && jobDetails.logs.length > 0 ? (
                         jobDetails.logs.map((log: any, i: number) => (
                           <div key={i} className={`flex flex-col gap-1 ${

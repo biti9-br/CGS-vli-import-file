@@ -106,12 +106,21 @@ async function processJob(jobId: string) {
     await jobRef.update({ status: "running", updatedAt: FieldValue.serverTimestamp() });
     await writeLog("info", "Processamento iniciado.", jobId);
 
-    // Fetch all pending payloads for this job, ordered by rowIndex
-    const pendingSnap = await payloadsCol
-      .where("jobId", "==", jobId)
-      .where("status", "==", "pending")
-      .orderBy("rowIndex")
-      .get();
+    // Fetch pending payloads for this job
+    // NOTE: No .orderBy() here — composite indexes not yet deployed.
+    // We sort in memory to avoid "requires an index" Firestore errors.
+    let pendingSnap;
+    try {
+      pendingSnap = await payloadsCol
+        .where("jobId", "==", jobId)
+        .where("status", "==", "pending")
+        .get();
+    } catch (queryErr: any) {
+      console.error(`[processJob] Falha ao buscar payloads: ${queryErr.message}`);
+      await jobRef.update({ status: "failed", updatedAt: FieldValue.serverTimestamp() });
+      await writeLog("error", `Falha ao buscar payloads: ${queryErr.message}`, jobId);
+      return;
+    }
 
     if (pendingSnap.empty) {
       await jobRef.update({ status: "completed", updatedAt: FieldValue.serverTimestamp() });
@@ -119,10 +128,13 @@ async function processJob(jobId: string) {
       return;
     }
 
-    let processed = 0;
-    const total = pendingSnap.size;
+    // sort by rowIndex in memory
+    const pendingDocs = pendingSnap.docs.slice().sort((a, b) => (a.data().rowIndex ?? 0) - (b.data().rowIndex ?? 0));
 
-    for (const doc of pendingSnap.docs) {
+    let processed = 0;
+    const total = pendingDocs.length;
+
+    for (const doc of pendingDocs) {
       // Check for stop signal
       if (stopSignals.has(jobId)) {
         await jobRef.update({ status: "paused", updatedAt: FieldValue.serverTimestamp() });
@@ -491,20 +503,30 @@ async function startServer() {
 
       const data = snap.data()!;
 
-      // Fetch last 200 logs for this job
-      const logsSnap = await logsCol
-        .where("jobId", "==", req.params.id)
-        .orderBy("timestamp", "desc")
-        .limit(200)
-        .get();
-
-      const logs = logsSnap.docs.map(d => ({
-        type: d.data().type,
-        message: d.data().message,
-        time: (d.data().timestamp instanceof Timestamp)
-          ? d.data().timestamp.toDate().toLocaleTimeString("pt-BR")
-          : "",
-      }));
+      // Fetch logs for this job
+      // NOTE: No .orderBy() — requires composite index not yet deployed. Sorted in memory.
+      let logs: any[] = [];
+      let _logsError: string | undefined;
+      try {
+        const logsSnap = await logsCol
+          .where("jobId", "==", req.params.id)
+          .limit(500)
+          .get();
+        logs = logsSnap.docs
+          .map(d => ({
+            type: d.data().type,
+            message: d.data().message,
+            time: (d.data().timestamp instanceof Timestamp)
+              ? d.data().timestamp.toDate().toLocaleTimeString("pt-BR")
+              : "",
+            _ts: d.data().timestamp?.toMillis?.() ?? 0,
+          }))
+          .sort((a, b) => b._ts - a._ts) // newest first
+          .map(({ _ts, ...rest }) => rest);
+      } catch (logsErr: any) {
+        _logsError = logsErr.message;
+        console.error(`[GET /api/jobs/:id] Falha ao buscar logs: ${logsErr.message}`);
+      }
 
       res.json({
         id: snap.id,
@@ -516,6 +538,7 @@ async function startServer() {
         createdAt: tsToIso(data.createdAt),
         updatedAt: tsToIso(data.updatedAt),
         logs,
+        ...(  _logsError ? { _logsError } : {}),
       });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
