@@ -53,10 +53,12 @@ const jobTokens = new Map<string, string>(); // jobId → apiToken
 async function writeLog(type: string, message: string, jobId?: string, details?: any) {
   console.log(`[${type.toUpperCase()}]${jobId ? ` [${jobId}]` : ""} ${message}`);
   try {
+    const expiresAt = Timestamp.fromDate(new Date(Date.now() + 14 * 24 * 60 * 60 * 1000));
     const entry: Record<string, any> = {
       type,
       message,
       timestamp: FieldValue.serverTimestamp(),
+      expiresAt,
     };
     if (jobId) entry.jobId = jobId;
     if (details) entry.details = (typeof details === "string" ? details : JSON.stringify(details)).slice(0, 5000);
@@ -422,6 +424,7 @@ async function startServer() {
 
       // Create job document — apiToken persisted to survive container restarts
       // It is never returned in GET responses (stripped server-side)
+      const jobExpiresAt = Timestamp.fromDate(new Date(Date.now() + 14 * 24 * 60 * 60 * 1000));
       await jobRef.set({
         status: "pending",
         progress: 0,
@@ -429,6 +432,7 @@ async function startServer() {
         closeExisting: config.closeExisting ?? false,
         apiToken: config.apiToken,
         fileName: "",
+        expiresAt: jobExpiresAt,
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       });
@@ -449,6 +453,7 @@ async function startServer() {
               cleanFields[k] = String(v).trim();
             }
           });
+          const payloadExpiresAt = Timestamp.fromDate(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000));
           batch.set(payloadsCol.doc(), {
             jobId: id,
             rowIndex: i + idx,
@@ -458,6 +463,7 @@ async function startServer() {
             status: "pending",
             errorMessage: null,
             sentAt: null,
+            expiresAt: payloadExpiresAt,
             createdAt: FieldValue.serverTimestamp(),
           });
         });
@@ -540,6 +546,42 @@ async function startServer() {
         logs,
         ...(  _logsError ? { _logsError } : {}),
       });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Get payloads for a job (for the Records tab in the dashboard)
+  app.get("/api/jobs/:id/payloads", async (req, res) => {
+    try {
+      const { id } = req.params;
+      const statusFilter = req.query.status as string | undefined; // 'pending'|'sent'|'error'
+
+      // Single-field filter only — no orderBy — no composite index needed
+      const snap = await payloadsCol.where("jobId", "==", id).get();
+
+      let docs = snap.docs.map(d => {
+        const data = d.data();
+        return {
+          id: d.id,
+          rowIndex: data.rowIndex ?? 0,
+          reference: data.reference,
+          status: data.status,
+          errorMessage: data.errorMessage ?? null,
+          sentAt: tsToIso(data.sentAt),
+        };
+      });
+
+      if (statusFilter) {
+        docs = docs.filter(d => d.status === statusFilter);
+      } else {
+        // by default hide pending to avoid returning 11k records
+        docs = docs.filter(d => d.status !== "pending");
+      }
+
+      docs.sort((a, b) => a.rowIndex - b.rowIndex);
+
+      res.json({ total: docs.length, payloads: docs.slice(0, 500) });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
