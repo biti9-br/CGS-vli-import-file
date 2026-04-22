@@ -80,7 +80,15 @@ async function processJob(jobId: string) {
   stopSignals.delete(jobId);
 
   const jobRef = jobsCol.doc(jobId);
-  const apiToken = jobTokens.get(jobId);
+
+  // Try memory first, then fall back to Firestore (survives container restarts)
+  let apiToken = jobTokens.get(jobId);
+  if (!apiToken) {
+    try {
+      const snap = await jobRef.get();
+      apiToken = snap.data()?.apiToken;
+    } catch {}
+  }
 
   if (!apiToken) {
     console.error(`[processJob] Token não encontrado para job ${jobId}. Pausando.`);
@@ -400,18 +408,20 @@ async function startServer() {
       const id = crypto.randomUUID();
       const jobRef = jobsCol.doc(id);
 
-      // Create job document (token NOT stored in Firestore)
+      // Create job document — apiToken persisted to survive container restarts
+      // It is never returned in GET responses (stripped server-side)
       await jobRef.set({
         status: "pending",
         progress: 0,
         total: data.length,
         closeExisting: config.closeExisting ?? false,
+        apiToken: config.apiToken,
         fileName: "",
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       });
 
-      // Store token in memory only
+      // Also keep in memory for fast access in the current session
       jobTokens.set(id, config.apiToken);
 
       // Create payload documents in batches of 500
@@ -527,25 +537,30 @@ async function startServer() {
     }
   });
 
-  // Resume job — requires apiToken in body since token is not stored in Firestore
+  // Resume job — reads persisted token from Firestore; body.apiToken overrides if needed
   app.post("/api/jobs/:id/resume", async (req, res) => {
     try {
       const { id } = req.params;
       const snap = await jobsCol.doc(id).get();
       if (!snap.exists) return res.status(404).json({ error: "Job not found" });
 
-      const { status } = snap.data()!;
+      const { status, apiToken: storedToken } = snap.data()!;
       if (status !== "paused" && status !== "failed") {
         return res.status(400).json({ error: `Job status is '${status}', cannot resume.` });
       }
 
-      const apiToken = req.body.apiToken || jobTokens.get(id);
+      // Body token takes priority (allows updating), otherwise use stored token
+      const apiToken = req.body.apiToken?.trim() || jobTokens.get(id) || storedToken;
       if (!apiToken) {
-        return res.status(400).json({ error: "apiToken required to resume. Token not stored for security." });
+        return res.status(400).json({ error: "apiToken not found. Provide it in the request body." });
       }
 
+      // Persist updated token if a new one was provided
+      const updateData: Record<string, any> = { status: "pending", updatedAt: FieldValue.serverTimestamp() };
+      if (req.body.apiToken?.trim()) updateData.apiToken = req.body.apiToken.trim();
+
       jobTokens.set(id, apiToken);
-      await snap.ref.update({ status: "pending", updatedAt: FieldValue.serverTimestamp() });
+      await snap.ref.update(updateData);
       await writeLog("info", "Retomando importação...", id);
       processJob(id).catch(console.error);
       res.json({ success: true });

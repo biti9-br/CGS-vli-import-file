@@ -65,9 +65,25 @@ export default function JobsDashboard({ showModal, showConfirm }: JobsDashboardP
     fetchJobs();
   };
 
-  const handleResume = (id: string) => {
-    // Token is never stored in Firestore — user must provide it again to resume
-    setResumePrompt({ jobId: id, token: '' });
+  const handleResume = async (id: string) => {
+    // Token is stored in Firestore — resume works automatically
+    // Modal only appears as fallback if token is missing (e.g., legacy jobs)
+    try {
+      const res = await fetch(`/api/jobs/${id}/resume`, { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+      if (res.ok) {
+        fetchJobs();
+        return;
+      }
+      const err = await res.json();
+      // Only prompt for token if server says it's missing
+      if (res.status === 400 && err.error?.includes('apiToken')) {
+        setResumePrompt({ jobId: id, token: '' });
+      } else {
+        showModal('Erro', err.error || 'Não foi possível retomar.', 'error');
+      }
+    } catch (e: any) {
+      showModal('Erro', e.message, 'error');
+    }
   };
 
   const confirmResume = async () => {
